@@ -182,10 +182,11 @@ Three section shapes deviate:
 - **A mesh with no vertex block.** Warhammer 3's decals declare a vertex
   count and ship no vertices; the game builds the geometry. The count is
   kept so the file re-saves as it was read.
-- **Extra data after the index block.** Attila's ropes follow their
-  indices with a list of u16 that is plainly more indices but in no
-  layout described here. The section size is authoritative, so whatever
-  is past the indices is kept with the mesh.
+- **Extra data after the index block.** A rope has no indices of its
+  own, then a list of u16 that is the game's triangulation of its tube:
+  24 triangles a segment and a ten-triangle fan at each end, 212, 404
+  and 788 for 9, 17 and 33 nodes. The section size is authoritative, so
+  whatever is past the indices is kept with the mesh.
 - **Indices before vertices.** A tree's furthest LOD is a generated
   billboard — a flat card in the 12-byte position-and-uv layout — and it
   lays its section out as material, index block, vertices. Its section
@@ -290,12 +291,37 @@ and the decal family runs 67, then 87, then 95 — so dispatch goes by id
 
 **Cloth, weighted cloth, collision shapes and rope** (ids 58, 60, 62, 93)
 are an ordinary weighted material followed by a block of their own: for
-cloth and rope a simulation graph — a count, then triples of two vertex
-indices and a rest length — and for a collision shape twenty bytes.
-Nothing in Blender could rebuild either, so the block is kept exactly as
-read and written back with its material. The allowance is limited to
-those four ids; anywhere else, a material that does not consume its
-declared size stays a parse error.
+cloth a simulation graph — a count, then triples of two vertex indices
+and a rest length — and for a collision shape twenty bytes. Nothing in
+Blender could rebuild either, so the block is kept exactly as read and
+written back with its material. The allowance is limited to those four
+ids; anywhere else, a material that does not consume its declared size
+stays a parse error.
+
+**A rope's block is its geometry.** A rope declares vertex format 11
+and ships no vertices; the game sweeps a twelve-sided tube along a
+chain of nodes, and the chain is all the file holds:
+
+| Field | Type | |
+| --- | --- | --- |
+| node count *n* | u32 | |
+| start attachment | i32 vertex, i32 cloth | −1, −1 when free |
+| end attachment | i32 vertex, i32 cloth | |
+| radius | f32 | 0.03124 in every rope seen |
+| unknown | u32 | 0, 8, 16 or 32, never above *n* − 1 |
+| nodes × *n* | f32 x, y, z, inverse mass, u | inverse mass 0 pins the node |
+| links × *n* − 1 | u32 i, u32 j, f32 rest length | |
+
+The cloth an attachment names counts the file's cloth meshes (id 60)
+in order, and the vertex is one of that mesh's: across all 28 ropes of
+a corbita's sails, every attached end sits on the named vertex to half
+precision. u is the texture coordinate along the rope, and each rest
+length is its link's authored length. The rope's bounding box is the
+swept tube's, within the radius of the nodes but not derivable from
+them exactly. In Blender a rope is its chain — vertices and edges, with
+inverse mass and u as point attributes — and export writes the chain
+back, so an untouched rope goes out byte for byte and an edited one
+gets fresh rest lengths and a box of the nodes padded by the radius.
 
 Five families are **not decoded**: ids 26, 40, 45, 54, 57 and 84 —
 `non_renderable`, campaign settlement pieces, point lights, statues and

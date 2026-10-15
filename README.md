@@ -113,8 +113,10 @@ editable, and read back on export.
 Material types survive as what they are rather than being flattened into
 one: weighted, custom terrain, terrain tiles, the projected-decal family,
 cloth, rope, collision shapes, bow waves and interface banners each
-export as the material they were imported as. Cloth and rope simulation
-blocks, which nothing in Blender could rebuild, are preserved verbatim.
+export as the material they were imported as. Cloth simulation blocks,
+which nothing in Blender could rebuild, are preserved verbatim. Ropes
+have no triangles in the file, only a chain of simulation nodes, so they
+import as that chain (with a tube preview) and export from it.
 
 ## Not supported
 

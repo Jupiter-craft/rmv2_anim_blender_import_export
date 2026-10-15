@@ -1081,6 +1081,55 @@ class TestZeroVertexMesh(unittest.TestCase):
         self.assertEqual(rf.save(out), blob)
 
 
+class TestRope(unittest.TestCase):
+    """A rope's block: a header, its nodes, and the links between them."""
+
+    @staticmethod
+    def block(n=4, attach=(0, 2, -1, -1)):
+        nodes = np.zeros(n, rf._ROPE_NODE)
+        nodes["position"][:, 1] = np.arange(n, dtype=np.float32) * 0.5
+        nodes["inv_mass"] = 1.0
+        nodes["inv_mass"][-1] = 0.0
+        nodes["u"] = -np.arange(n, dtype=np.float32)
+        links = np.zeros(n - 1, rf._ROPE_LINK)
+        links["i"] = np.arange(n - 1)
+        links["j"] = np.arange(1, n)
+        links["rest"] = 0.5
+        return (struct.pack("<I4ifI", n, *attach, 0.03125, 0)
+                + nodes.tobytes() + links.tobytes())
+
+    def test_decodes_and_writes_back(self):
+        blob = self.block()
+        graph = rf.decode_rope(blob)
+        self.assertIsNotNone(graph)
+        self.assertEqual(len(graph.nodes), 4)
+        self.assertEqual(graph.start_attachment, (0, 2))
+        self.assertEqual(graph.end_attachment, (-1, -1))
+        self.assertAlmostEqual(graph.radius, 0.03125)
+        self.assertEqual(graph.write(), blob)
+
+    def test_a_block_of_another_shape_is_left_alone(self):
+        self.assertIsNone(rf.decode_rope(self.block() + b"\0"))
+        self.assertIsNone(rf.decode_rope(b"\0" * 20))   # a collision shape
+
+    def test_a_link_past_the_last_node_is_refused(self):
+        blob = bytearray(self.block())
+        struct.pack_into("<I", blob, len(blob) - 8, 99)
+        self.assertIsNone(rf.decode_rope(bytes(blob)))
+
+    def test_every_sample_rope_decodes(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "samples",
+                            "attila", "extra_ropes_dm1.rigid_model_v2")
+        if not os.path.isfile(path):
+            self.skipTest("sample not present")
+        with open(path, "rb") as handle:
+            rmv = rf.load(handle.read())
+        for model in rmv.lods[0].models:
+            graph = rf.decode_rope(model.material.trailing)
+            self.assertIsNotNone(graph, model.material.model_name)
+            self.assertEqual(graph.write(), model.material.trailing)
+
+
 class TestAnimRoundtrip(unittest.TestCase):
     def check(self, version, **kwargs):
         anim = make_anim(version=version, **kwargs)

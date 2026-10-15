@@ -39,6 +39,7 @@ from mathutils import Matrix
 from . import materials as rmv2_materials
 from . import mesh_build
 from . import rmv2_format as rf
+from . import rope as rmv2_rope
 from . import scene_layout
 from . import skeleton
 from . import utils
@@ -80,6 +81,13 @@ def _build_extra_json(material, model) -> str:
                       if i != rf.INT_PARAM_ALPHA]
         if other_ints:
             extra["int_params"] = other_ints
+        alpha = material.get_int_param(rf.INT_PARAM_ALPHA)
+        if alpha not in (None, rf.ALPHA_MODE_OPAQUE,
+                         rf.ALPHA_MODE_TRANSPARENT):
+            # Cloth and rope carry -1, which the dropdown has no entry
+            # for.  It shows as Transparent, like any non-zero value, and
+            # goes back as it came unless the dropdown is changed.
+            extra["alpha_raw"] = int(alpha)
         if material.vec4_params:
             extra["vec4_params"] = [[i, list(v)]
                                     for i, v in material.vec4_params]
@@ -110,6 +118,12 @@ def _build_extra_json(material, model) -> str:
         # Cloth, rope and collision shapes: a simulation block this
         # add-on does not interpret and Blender could not rebuild.
         extra["material_trailing"] = _bytes_to_hex(material.trailing)
+    if _rope_graph(model) is not None:
+        # A rope's vertex format (11 in every one seen) has no layout and
+        # so no entry in the dropdown, and its bounding box is the tube's
+        # rather than anything the node chain gives back exactly.
+        extra["rope_vertex_format"] = int(material.vertex_format)
+        extra["rope_bbox"] = [list(model.bbox_min), list(model.bbox_max)]
     if model.section_tail:
         extra["section_tail"] = _bytes_to_hex(model.section_tail)
     if model.indices_first:
@@ -159,6 +173,15 @@ def _fill_object_settings(obj, model, material):
     s.extra_json = _build_extra_json(material, model)
 
 
+def _rope_graph(model):
+    """The node chain of a rope that ships no vertices of its own."""
+    material = model.material
+    if (material.material_id != rf.MAT_ROPE or model.mesh.vertex_count
+            or not getattr(material, "trailing", b"")):
+        return None
+    return rf.decode_rope(material.trailing)
+
+
 def _build_mesh_object(model, version: int, name: str, scale: float,
                        bone_names: dict, options: dict):
     mesh_data = model.mesh
@@ -172,12 +195,18 @@ def _build_mesh_object(model, version: int, name: str, scale: float,
     # object origin.
     pivot_b = np.array(
         utils.game_to_blender_v(material.pivot), np.float32) * scale
-    pos_b = utils.game_to_blender(mesh_data.positions) * scale
 
-    # The game->Blender map is a reflection (det -1), so winding must be
-    # reversed once to keep faces front-facing (see utils.py).
-    tris = utils.reverse_winding(mesh_data.indices.reshape(-1, 3))
-    me, loop_vidx = mesh_build.build_mesh(name, pos_b, tris)
+    # A rope has no vertices: its geometry is the node chain in its
+    # material block, which becomes the mesh instead.
+    rope = _rope_graph(model)
+    if rope is not None:
+        me = rmv2_rope.build_mesh(name, rope, scale)
+    else:
+        pos_b = utils.game_to_blender(mesh_data.positions) * scale
+        # The game->Blender map is a reflection (det -1), so winding must
+        # be reversed once to keep faces front-facing (see utils.py).
+        tris = utils.reverse_winding(mesh_data.indices.reshape(-1, 3))
+        me, loop_vidx = mesh_build.build_mesh(name, pos_b, tris)
 
     if n:
         mesh_build.add_uv_layer(me, "UVMap", utils.flip_uv_v(mesh_data.uv0),
@@ -202,6 +231,8 @@ def _build_mesh_object(model, version: int, name: str, scale: float,
     mesh_build.add_vertex_groups(obj, mesh_data.bone_indices,
                                  mesh_data.bone_weights, bone_names)
     _fill_object_settings(obj, model, material)
+    if rope is not None:
+        rmv2_rope.add_preview(obj, rope.radius * scale)
 
     if options.get("build_materials", True):
         alpha = obj.rmv2.alpha_mode

@@ -141,6 +141,10 @@ Turn it off to write a single level, chosen with **LOD Level**. You get a warnin
 
 `.variant_part_mesh` has no textures in the file either, and no slots to put any in — its material is three names. That is the format, not a failed import.
 
+### A rope is a line of points
+
+Ship rigging (`rope_mesh_*`, material `rope`) has no triangles in the file: the game sweeps a tube along a chain of simulation nodes. A rope imports as exactly that chain, one vertex per node joined by edges, with a **Rope Preview** modifier sweeping a tube the game's width so you can see it. The preview is display only; export reads the chain itself. Move, add or remove points freely, but keep it one unbranched chain, since that is all a rope can be. The ends stay attached to whatever sail or block they were attached to, and the Rope Preview's **Radius** is the rope's thickness.
+
 ## Collections are "the model"
 
 This is the bit that trips up people used to a flatter Blender scene: the add-on treats **collections**, not loose objects, as the real unit.

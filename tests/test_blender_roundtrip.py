@@ -3993,6 +3993,93 @@ def rma_plain_file_case(tmpdir):
           "the user is told the animation is missing")
 
 
+def rope_case(tmpdir):
+    """A rope's geometry is the node chain in its material block.
+
+    It ships no vertices, so the importer used to make an empty object
+    and the exporter then skipped it for having no faces - a round trip
+    silently dropped every rope in the file.
+    """
+    print("\n=== rope ===")
+    reset_scene()
+    sample = os.path.join(SAMPLES, "attila", "extra_ropes_dm1.rigid_model_v2")
+    if not os.path.isfile(sample):
+        print("  (skipped - sample not present)")
+        return
+    source = rf.load(open(sample, "rb").read())
+
+    root, stats = import_rmv2.import_file(bpy.context, sample, {
+        "import_lods": "ALL", "build_materials": True, "texture_root": "",
+        "create_attach_empties": False, "global_scale": 1.0,
+    })
+    ropes = list(root.children[0].objects)
+    check(len(ropes) == 13, f"all 13 ropes imported ({len(ropes)})")
+    shapes = sorted({(len(o.data.vertices), len(o.data.edges),
+                      len(o.data.polygons)) for o in ropes})
+    check(shapes == [(9, 8, 0), (17, 16, 0)],
+          f"each rope is a chain of its nodes ({shapes})")
+    rope = next(o for o in ropes if o.rmv2.model_name == "rope_mesh_02_LOD1")
+    check(rope.data.attributes.get("rmv2_rope_inv_mass") is not None,
+          "inverse mass kept as a point attribute")
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    preview = rope.evaluated_get(depsgraph).to_mesh()
+    check(len(preview.polygons) > 0, "the preview sweeps a tube")
+    rope.evaluated_get(depsgraph).to_mesh_clear()
+
+    activate_collection(root.name)
+    dst = os.path.join(tmpdir, "ropes.rigid_model_v2")
+    out_stats, warnings = export_rmv2.export_file(bpy.context, dst, {
+        "source": "AUTO", "version": "6", "skeleton_name": "",
+        "apply_modifiers": True, "high_precision": True,
+        "write_attach_points": True, "global_scale": 1.0,
+    })
+    print("  export warnings:", warnings or "none")
+    result = rf.load(open(dst, "rb").read())
+    check(len(result.lods[0].models) == 13,
+          f"no rope dropped on export ({len(result.lods[0].models)})")
+    same = [a.material.write(6) == b.material.write(6)
+            and a.section_tail == b.section_tail
+            and (a.bbox_min, a.bbox_max) == (b.bbox_min, b.bbox_max)
+            for a, b in zip(source.lods[0].models, result.lods[0].models)]
+    check(all(same), f"untouched ropes go back byte for byte "
+          f"({same.count(False)} differ)")
+
+    # Move a node and extrude one off the end: the chain is re-read.
+    me = rope.data
+    me.vertices[3].co.z += 1.0
+    count = len(me.vertices)
+    me.vertices.add(1)
+    me.vertices[count].co = me.vertices[count - 1].co.copy()
+    me.vertices[count].co.z -= 0.5
+    me.edges.add(1)
+    me.edges[-1].vertices = (count - 1, count)
+    me.update()
+    export_rmv2.export_file(bpy.context, dst, {
+        "source": "AUTO", "version": "6", "skeleton_name": "",
+        "apply_modifiers": True, "high_precision": True,
+        "write_attach_points": True, "global_scale": 1.0,
+    })
+    edited = next(m for m in rf.load(open(dst, "rb").read()).lods[0].models
+                  if m.material.model_name == "rope_mesh_02_LOD1")
+    graph = rf.decode_rope(edited.material.trailing)
+    check(graph is not None and len(graph.nodes) == count + 1
+          and len(graph.links) == count,
+          "an extruded node joins the chain")
+    if graph is not None:
+        lift = float(graph.nodes["position"][3][1])
+        before = next(m for m in source.lods[0].models
+                      if m.material.model_name == "rope_mesh_02_LOD1")
+        old = rf.decode_rope(before.material.trailing)
+        check(abs(lift - float(old.nodes["position"][3][1]) - 1.0) < 1e-5,
+              "a moved node moves in game space")
+        segment = np.linalg.norm(graph.nodes["position"][3]
+                                 - graph.nodes["position"][2])
+        check(abs(float(graph.links["rest"][2]) - segment) < 1e-5,
+              "its links' rest lengths follow it")
+        check(edited.bbox_max[1] >= lift + graph.radius - 1e-6,
+              "the bounding box grows to the moved node")
+
+
 def main():
     print(f"Blender {bpy.app.version_string}")
     io_scene_rmv2.register()
@@ -4054,6 +4141,7 @@ def main():
         vwm_requires_skeleton_case(tmpdir)
         rma_case(tmpdir)
         rma_plain_file_case(tmpdir)
+        rope_case(tmpdir)
     except Exception:
         traceback.print_exc()
         FAILURES.append("unhandled exception (see traceback)")

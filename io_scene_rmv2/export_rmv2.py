@@ -10,6 +10,10 @@ Pipeline per mesh object:
   -> quantized to file precision and welded into unique vertices
   -> bone weights resolved from vertex groups (attachment-point names,
      bone_<i> names, or armature bone order)
+
+A rope is the exception: it ships no vertices, and its object's own
+(unevaluated) vertex-and-edge chain goes into its material block instead
+- see rope.py.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import numpy as np
 
 from . import mesh_build
 from . import rmv2_format as rf
+from . import rope as rmv2_rope
 from . import skeleton
 from . import utils
 from .properties import (VERTEX_FORMAT_TO_INT, chosen_version,
@@ -920,7 +925,9 @@ def _material_from_settings(obj, settings, fmt: int, scale: float,
                     or utils.strip_blender_suffix(obj.name))[:31],
         texture_directory=settings.texture_directory,
         filters=settings.filters,
-        pivot=tuple(v * scale for v in utils.blender_to_game_v(pivot_b)),
+        # + 0.0 turns the -0.0 that negating a zero axis leaves into 0.0.
+        pivot=tuple(v * scale + 0.0
+                    for v in utils.blender_to_game_v(pivot_b)),
         matrix_index=_resolve_matrix_index(obj, settings),
         parent_matrix_index=settings.parent_matrix_index,
     )
@@ -950,6 +957,8 @@ def _material_from_settings(obj, settings, fmt: int, scale: float,
         alpha = (rf.ALPHA_MODE_TRANSPARENT
                  if settings.alpha_mode == "TRANSPARENT"
                  else rf.ALPHA_MODE_OPAQUE)
+        if "alpha_raw" in extra and settings.alpha_mode == "TRANSPARENT":
+            alpha = int(extra["alpha_raw"])
         int_params.append((rf.INT_PARAM_ALPHA, alpha))
     int_params += [(int(i), int(v)) for i, v in extra.get("int_params", [])
                    if int(i) != rf.INT_PARAM_ALPHA]
@@ -972,6 +981,11 @@ def build_model(context, obj, options, attach_points, attach_names,
                 vertex_format_override=None) -> rf.RmvModel | None:
     settings = obj.rmv2
     scale = options.get("global_scale", 1.0)
+
+    if (rmv2_rope.is_rope_object(obj)
+            and int(options.get("version", "7")) not in rf.SHOGUN2_VERSIONS):
+        return _build_rope_model(obj, settings, options, attach_points,
+                                 warnings)
 
     arrays = extract_mesh_arrays(context, obj, options, warnings,
                                  decimate_ratio)
@@ -1077,50 +1091,99 @@ def build_model(context, obj, options, attach_points, attach_names,
 
         material = _material_from_settings(obj, settings, fmt, scale,
                                            attach_points, options)
-
-        shader_name = settings.shader_name or rf.DEFAULT_SHADER_NAME
-        extra = {}
-        if settings.extra_json:
-            try:
-                extra = json.loads(settings.extra_json)
-            except ValueError:
-                extra = {}
-        shader_extra = b"\0" * 10
-        shader_zero = b"\0" * 10
-        try:
-            if "shader_extra" in extra:
-                shader_extra = bytes.fromhex(extra["shader_extra"])
-            if "shader_zero" in extra:
-                shader_zero = bytes.fromhex(extra["shader_zero"])
-        except ValueError:
-            pass
-
-        section_tail = b""
-        if "section_tail" in extra:
-            # Attila's ropes keep a run of further indices after the
-            # index block; there is nothing in Blender that stands for
-            # it, so it rides along in the object's extra data.
-            try:
-                section_tail = bytes.fromhex(extra["section_tail"])
-            except ValueError:
-                section_tail = b""
-
-        # A generated tree billboard: index block before the vertex
-        # block, and a section size that never covered the vertices.
-        declared_section = int(extra.get("declared_section_size") or 0)
-        return rf.RmvModel(
-            material=material,
-            mesh=mesh,
-            render_flag=settings.render_flag,
-            shader_name=shader_name,
-            shader_extra=shader_extra,
-            shader_zero=shader_zero,
-            section_tail=section_tail,
-            indices_first=bool(extra.get("indices_first")),
-            declared_section_size=declared_section or None,
-        )
+        return _assemble_model(settings, material, mesh)
     finally:
         arrays["source_object"].to_mesh_clear()
+
+
+def _extra_data(settings) -> dict:
+    if settings.extra_json:
+        try:
+            return json.loads(settings.extra_json)
+        except ValueError:
+            pass
+    return {}
+
+
+def _assemble_model(settings, material, mesh) -> rf.RmvModel:
+    shader_name = settings.shader_name or rf.DEFAULT_SHADER_NAME
+    extra = _extra_data(settings)
+    shader_extra = b"\0" * 10
+    shader_zero = b"\0" * 10
+    try:
+        if "shader_extra" in extra:
+            shader_extra = bytes.fromhex(extra["shader_extra"])
+        if "shader_zero" in extra:
+            shader_zero = bytes.fromhex(extra["shader_zero"])
+    except ValueError:
+        pass
+
+    section_tail = b""
+    if "section_tail" in extra:
+        # A rope's section ends with the game's triangulation of its
+        # tube, an index run nothing in Blender stands for, so it rides
+        # along in the object's extra data.
+        try:
+            section_tail = bytes.fromhex(extra["section_tail"])
+        except ValueError:
+            section_tail = b""
+
+    # A generated tree billboard: index block before the vertex
+    # block, and a section size that never covered the vertices.
+    declared_section = int(extra.get("declared_section_size") or 0)
+    return rf.RmvModel(
+        material=material,
+        mesh=mesh,
+        render_flag=settings.render_flag,
+        shader_name=shader_name,
+        shader_extra=shader_extra,
+        shader_zero=shader_zero,
+        section_tail=section_tail,
+        indices_first=bool(extra.get("indices_first")),
+        declared_section_size=declared_section or None,
+    )
+
+
+# Every rope seen declares vertex format 11 and then ships no vertices.
+_ROPE_VERTEX_FORMAT = 11
+
+
+def _build_rope_model(obj, settings, options, attach_points,
+                      warnings) -> rf.RmvModel | None:
+    """A rope: no vertices, and its node chain in the material block."""
+    scale = options.get("global_scale", 1.0)
+    extra = _extra_data(settings)
+    original = None
+    try:
+        original = rf.decode_rope(
+            bytes.fromhex(extra.get("material_trailing", "")))
+    except ValueError:
+        pass
+
+    graph = rmv2_rope.read_graph(obj, scale, original, warnings)
+    if graph is None:
+        warnings.append(f"{obj.name}: rope skipped")
+        return None
+
+    fmt = int(extra.get("rope_vertex_format", _ROPE_VERTEX_FORMAT))
+    material = _material_from_settings(obj, settings, fmt, scale,
+                                       attach_points, options)
+    material.trailing = graph.write()
+    model = _assemble_model(settings, material, rf.RmvMeshData.empty(0, 0))
+
+    # The box the file had is the swept tube's, which the chain does not
+    # give back exactly; while the chain is unchanged it is kept, and
+    # otherwise the nodes padded by the radius bound the tube.
+    unchanged = (original is not None
+                 and material.trailing == original.write())
+    if unchanged and "rope_bbox" in extra:
+        model.bbox_min, model.bbox_max = (tuple(v)
+                                          for v in extra["rope_bbox"])
+    else:
+        pos = graph.nodes["position"].astype(np.float64)
+        model.bbox_min = tuple((pos.min(axis=0) - graph.radius).tolist())
+        model.bbox_max = tuple((pos.max(axis=0) + graph.radius).tolist())
+    return model
 
 
 def _encode_dirs(vec: np.ndarray) -> np.ndarray:

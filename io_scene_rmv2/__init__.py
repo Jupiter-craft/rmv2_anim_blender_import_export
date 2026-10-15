@@ -86,7 +86,7 @@ if "bpy" in locals():
     for _mod_name in ("rmv2_format", "anim_format", "arm_format",
                       "vmpf_format", "vwm_format",
                       "utils", "skeleton", "scene_layout",
-                      "mesh_build",
+                      "mesh_build", "rope",
                       "properties", "materials", "import_rmv2",
                       "export_rmv2", "import_anim", "export_anim",
                       "import_arm", "export_arm",
@@ -117,6 +117,7 @@ from . import materials  # noqa: E402,F401
 from . import mesh_build  # noqa: E402,F401
 from . import properties  # noqa: E402
 from . import rmv2_format  # noqa: E402,F401
+from . import rope  # noqa: E402,F401
 from . import scene_layout  # noqa: E402,F401
 from . import skeleton  # noqa: E402,F401
 from . import ui  # noqa: E402

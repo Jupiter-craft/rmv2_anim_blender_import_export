@@ -191,6 +191,8 @@ MAT_CUSTOM_TERRAIN = 49
 MAT_TERRAIN_TILES = 101
 MAT_WEIGHTED = 65
 MAT_DEFAULT = 68
+MAT_CLOTH = 60
+MAT_ROPE = 93
 
 # TextureType
 TEXTURE_TYPE_NAMES = {
@@ -1628,6 +1630,66 @@ _TRAILING_BLOCK_IDS = (58, 60, 62, 93)
 # The 3D interface banners: a name and eight zero words, nothing else.
 # See NamedMaterial.
 _NAMED_MATERIAL_IDS = (29, 30)
+
+
+# A rope ships no vertices.  The game sweeps a twelve-sided tube along a
+# chain of simulation nodes, and that chain - in the block after the
+# material - is the whole of the rope:
+#
+#     u32       node count n
+#     i32 x 2   start attachment: vertex, cloth    (-1, -1 when there is none)
+#     i32 x 2   end attachment: vertex, cloth
+#     f32       tube radius
+#     u32       unknown: 0, 8, 16 or 32, never above n - 1
+#     n x       f32 x, y, z, inverse mass, u       (inverse mass 0 = pinned)
+#     n-1 x     u32 i, u32 j, f32 rest length
+#
+# An attachment's cloth counts the file's cloth meshes (id 60) in order,
+# and its vertex is one of that mesh's; the attached end node sits on
+# that vertex to half precision.  The positions are in the same space as
+# any mesh's vertices.  u is the texture coordinate along the rope, and
+# each rest length is its link's length as authored.  The triangulation
+# of the tube - 24 triangles a segment and a ten-triangle fan at each
+# end - is the run of indices in the mesh's section tail.
+_ROPE_HEADER = struct.Struct("<I4ifI")
+_ROPE_NODE = np.dtype([("position", "<f4", (3,)), ("inv_mass", "<f4"),
+                       ("u", "<f4")])
+_ROPE_LINK = np.dtype([("i", "<u4"), ("j", "<u4"), ("rest", "<f4")])
+
+
+@dataclass
+class RopeGraph:
+    nodes: np.ndarray                   # (n,) _ROPE_NODE, game space
+    links: np.ndarray                   # (n-1,) _ROPE_LINK
+    start_attachment: tuple = (-1, -1)  # (vertex, cloth)
+    end_attachment: tuple = (-1, -1)
+    radius: float = 0.03125
+    unknown: int = 0
+
+    def write(self) -> bytes:
+        return (_ROPE_HEADER.pack(len(self.nodes), *self.start_attachment,
+                                  *self.end_attachment, self.radius,
+                                  self.unknown)
+                + self.nodes.astype(_ROPE_NODE).tobytes()
+                + self.links.astype(_ROPE_LINK).tobytes())
+
+
+def decode_rope(block: bytes) -> Optional[RopeGraph]:
+    """A rope material's trailing block as a node chain, or None when the
+    block is not laid out that way - it is then simply kept as read."""
+    if len(block) < _ROPE_HEADER.size:
+        return None
+    n, sv, sc, ev, ec, radius, unknown = _ROPE_HEADER.unpack_from(block)
+    if n < 2 or len(block) != (_ROPE_HEADER.size + n * _ROPE_NODE.itemsize
+                               + (n - 1) * _ROPE_LINK.itemsize):
+        return None
+    nodes = np.frombuffer(block, _ROPE_NODE, n, _ROPE_HEADER.size).copy()
+    links = np.frombuffer(block, _ROPE_LINK, n - 1,
+                          _ROPE_HEADER.size + n * _ROPE_NODE.itemsize).copy()
+    if int(links["i"].max()) >= n or int(links["j"].max()) >= n:
+        return None
+    return RopeGraph(nodes=nodes, links=links, start_attachment=(sv, sc),
+                     end_attachment=(ev, ec), radius=radius, unknown=unknown)
 
 
 def _parse_material(buf: bytes, offset: int, material_id: int,
