@@ -4080,6 +4080,80 @@ def rope_case(tmpdir):
               "the bounding box grows to the moved node")
 
 
+def _binormal_agreement(before, after):
+    """Fraction of vertices whose exported binormal points the same way
+    as CA's, ignoring vertices where CA's own frame is degenerate (a
+    skybox pole, where the binormal lies along the normal)."""
+    agree = total = 0
+    for la, lb in zip(before.lods, after.lods):
+        for ma, mb in zip(la.models, lb.models):
+            a, b = ma.mesh, mb.mesh
+            if a.vertex_count != b.vertex_count or not np.any(a.binormals):
+                continue
+            good = (np.abs(np.einsum("ij,ij->i", a.binormals, a.normals))
+                    < 0.5) & (np.linalg.norm(a.binormals, axis=1) > 0.5)
+            same = np.einsum("ij,ij->i", a.binormals, b.binormals) > 0
+            agree += int((good & same).sum())
+            total += int(good.sum())
+    return agree / max(total, 1)
+
+
+def vertex_order_and_frame_case(tmpdir):
+    """A plain round trip keeps every vertex where it was, and writes the
+    binormal the way CA does.
+
+    Found on a corbita's sails, where all three broke the cloth:
+    - the weld sorted a little-endian vertex index byte-wise, so every
+      mesh past 256 vertices came back as 0, 256, 1, 257, ... - and a
+      cloth's simulation graph, its display mesh's binding block and the
+      ropes' attachments all name vertices by index;
+    - keying the weld on Blender's per-loop tangents split vertices an
+      untouched mesh never had, shifting those indices again;
+    - the binormal pointed along Blender's +V, which is the file's -v,
+      inverting every normal map's green channel.  MikkTSpace's sign is
+      also backwards wherever the authored normals oppose the winding,
+      which the skybox is here to catch.
+    """
+    print("\n=== vertex order and tangent frame ===")
+    samples = [os.path.join(SAMPLES, "threekingdoms", "pig.rigid_model_v2"),
+               os.path.join(SAMPLES, "warhammer",
+                            "campaign_skybox.rigid_model_v2")]
+    for sample in samples:
+        name = os.path.basename(sample)
+        if not os.path.isfile(sample):
+            print(f"  (skipped {name} - sample not present)")
+            continue
+        reset_scene()
+        source = rf.load(open(sample, "rb").read())
+        root, _ = import_rmv2.import_file(bpy.context, sample, {
+            "import_lods": "ALL", "build_materials": False,
+            "texture_root": "", "create_attach_empties": False,
+            "global_scale": 1.0,
+        })
+        activate_collection(root.name)
+        dst = os.path.join(tmpdir, "order_" + name)
+        export_rmv2.export_file(bpy.context, dst, {
+            "source": "AUTO", "version": str(source.version),
+            "skeleton_name": source.skeleton_name,
+            "apply_modifiers": True, "high_precision": True,
+            "write_attach_points": True, "global_scale": 1.0,
+        })
+        result = rf.load(open(dst, "rb").read())
+        pairs = [(a.mesh, b.mesh)
+                 for la, lb in zip(source.lods, result.lods)
+                 for a, b in zip(la.models, lb.models)]
+        check(all(a.vertex_count == b.vertex_count for a, b in pairs),
+              f"{name}: no vertex split or lost")
+        check(all(a.vertex_count == b.vertex_count
+                  and np.allclose(a.positions, b.positions, atol=1e-2)
+                  and np.array_equal(a.indices, b.indices)
+                  for a, b in pairs),
+              f"{name}: every vertex keeps its index")
+        share = _binormal_agreement(source, result)
+        check(share > 0.97,
+              f"{name}: binormals point CA's way ({share:.3f})")
+
+
 def main():
     print(f"Blender {bpy.app.version_string}")
     io_scene_rmv2.register()
@@ -4142,6 +4216,7 @@ def main():
         rma_case(tmpdir)
         rma_plain_file_case(tmpdir)
         rope_case(tmpdir)
+        vertex_order_and_frame_case(tmpdir)
     except Exception:
         traceback.print_exc()
         FAILURES.append("unhandled exception (see traceback)")

@@ -512,6 +512,44 @@ def _fallback_tangents(positions, uvs, normals, tri_loops, loop_vidx):
     return utils.normalize_rows(tangents, fallback=(1.0, 0.0, 0.0)), signs
 
 
+def _binormal_signs(positions, uvs, normals, tangents, tri_loops,
+                    loop_vidx, mikk_signs):
+    """Per-loop sign that points cross(normal, tangent) the way the game
+    wants the binormal: along +v of the *file's* UVs, dP/dv.  That holds
+    for every vanilla mesh checked, Empire to Warhammer 3, in every
+    format here.
+
+    It is taken from each triangle's own dP/dV rather than from Blender's
+    bitangent_sign.  MikkTSpace's sign follows the face winding, so on a
+    mesh whose authored normals disagree with it - an inside-out skybox,
+    foliage cards with normals bent outward - it comes out backwards for
+    exactly the triangles that matter.  Blender's V runs opposite to the
+    file's v (utils.flip_uv_v), so the target is -dP/dV here.  Triangles
+    with no UV area fall back to Mikk, negated for that same flip.
+    Getting this wrong lights normal maps with the green channel
+    inverted.
+    """
+    signs = -np.asarray(mikk_signs, np.float32).copy()
+    tris = tri_loops.reshape(-1, 3)
+    p = positions[loop_vidx[tris]].astype(np.float64)
+    uv = uvs[tris].astype(np.float64)
+    e1 = p[:, 1] - p[:, 0]
+    e2 = p[:, 2] - p[:, 0]
+    d1 = uv[:, 1] - uv[:, 0]
+    d2 = uv[:, 2] - uv[:, 0]
+    det = d1[:, 0] * d2[:, 1] - d2[:, 0] * d1[:, 1]
+    usable = np.abs(det) > 1e-12
+    dp_dv = (e2 * d1[:, :1] - e1 * d2[:, :1]) / np.where(
+        usable, det, 1.0)[:, None]
+    for corner in range(3):
+        loops = tris[:, corner]
+        frame = np.cross(normals[loops], tangents[loops])
+        along = -np.einsum("ij,ij->i", frame, dp_dv)
+        decided = usable & (np.abs(along) > 1e-12)
+        signs[loops[decided]] = np.where(along[decided] > 0, 1.0, -1.0)
+    return signs
+
+
 def extract_mesh_arrays(context, obj, options, warnings,
                         decimate_ratio=1.0):
     """Evaluated, triangulated per-loop arrays (Blender space), with the
@@ -625,8 +663,12 @@ def extract_mesh_arrays(context, obj, options, warnings,
         normals_w = utils.normalize_rows(normals @ nmat.T)
         tangents_w = utils.normalize_rows(tangents @ m3.T,
                                           fallback=(1.0, 0.0, 0.0))
-        binormals_w = np.cross(normals_w, tangents_w) * signs[:, None]
-        binormals_w = utils.normalize_rows(binormals_w,
+        # Built in object space and carried through m3 like the tangent,
+        # so a mirrored object transform does not flip it a second time.
+        binormals = np.cross(normals, tangents) * _binormal_signs(
+            positions, uv0, normals, tangents, tri_loops, loop_vidx,
+            signs)[:, None]
+        binormals_w = utils.normalize_rows(binormals @ m3.T,
                                            fallback=(0.0, 1.0, 0.0))
 
         if det < 0:
@@ -1026,23 +1068,31 @@ def build_model(context, obj, options, attach_points, attach_names,
         colours = arrays["colours"]
 
         # --- quantize to file precision, then weld ----------------------
+        # The tangent frame stays out of the key, for the reason
+        # weld_loops gives: Blender computes it per loop, so loops the
+        # file considers one vertex still disagree slightly across an
+        # edge, and keying on them split a twelfth of the vertices of an
+        # untouched mesh - shifting every index a cloth names.  The frames
+        # of the loops that collapse are averaged instead.
         n_q = _encode_dirs(normals_g)
-        t_q = _encode_dirs(tangents_g)
-        b_q = _encode_dirs(binormals_g)
         uv0_q = uv0.astype(np.float16).view(np.uint16)
         uv1_q = uv1.astype(np.float16).view(np.uint16)
         col_q = np.clip(np.round(colours * 255.0), 0, 255).astype(np.uint8)
 
+        # np.unique sorts these keys by their raw bytes, so the output
+        # vertex order is whatever that byte order says.  vidx is
+        # big-endian to make it a numeric sort: little-endian sorted by
+        # the low byte first (0, 256, 1, 257, ...) and shuffled every
+        # mesh past 256 vertices.  Order is not cosmetic - a cloth's
+        # simulation graph, a weighted cloth's binding block and rope
+        # attachments all name vertices by index, and are kept raw.
         key_dtype = np.dtype([
-            ("vidx", "<i4"), ("n", "u1", (3,)), ("t", "u1", (3,)),
-            ("b", "u1", (3,)), ("uv0", "<u2", (2,)), ("uv1", "<u2", (2,)),
-            ("col", "u1", (4,)),
+            ("vidx", ">i4"), ("n", "u1", (3,)), ("uv0", "<u2", (2,)),
+            ("uv1", "<u2", (2,)), ("col", "u1", (4,)),
         ])
         keys = np.zeros(nl, dtype=key_dtype)
         keys["vidx"] = loop_vidx
         keys["n"] = n_q
-        keys["t"] = t_q
-        keys["b"] = b_q
         keys["uv0"] = uv0_q
         keys["uv1"] = uv1_q
         keys["col"] = col_q
@@ -1050,6 +1100,7 @@ def build_model(context, obj, options, attach_points, attach_names,
         raw_view = keys.view(f"V{key_dtype.itemsize}").ravel()
         _, unique_idx, inverse = np.unique(
             raw_view, return_index=True, return_inverse=True)
+        inverse = inverse.reshape(-1)
         vcount = len(unique_idx)
         if vcount > 65536:
             raise ExportError(
@@ -1062,8 +1113,14 @@ def build_model(context, obj, options, attach_points, attach_names,
         mesh = rf.RmvMeshData.empty(vcount, k)
         mesh.positions = pos_game[src_vidx]
         mesh.normals = _decode_dirs(n_q[unique_idx])
-        mesh.tangents = _decode_dirs(t_q[unique_idx])
-        mesh.binormals = _decode_dirs(b_q[unique_idx])
+        def averaged(values, fallback):
+            out = np.zeros((vcount, 3), np.float64)
+            np.add.at(out, inverse, values)
+            out = utils.normalize_rows(out, fallback=fallback)
+            return _decode_dirs(_encode_dirs(out))
+
+        mesh.tangents = averaged(tangents_g, (1.0, 0.0, 0.0))
+        mesh.binormals = averaged(binormals_g, (0.0, 1.0, 0.0))
         mesh.uv0 = uv0_q[unique_idx].view(np.float16).astype(np.float32)
         mesh.uv1 = uv1_q[unique_idx].view(np.float16).astype(np.float32)
         mesh.colours = col_q[unique_idx].astype(np.float32) / 255.0

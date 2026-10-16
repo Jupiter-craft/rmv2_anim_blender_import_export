@@ -351,6 +351,28 @@ half4 in the wide ones.
 | PositionUV | 12 | `pos` half4, `uv` half2 |
 | Sway | 20 | See below |
 
+**The binormal points along +v of the file's own UVs** (dP/dv, with v
+running down from a top-left origin), and the tangent along +u. That
+holds in every vanilla mesh in `samples/`, Empire to Warhammer 3, and
+in `.rigid_model`, `.variant_weighted_mesh` and `.variant_part_mesh`
+too - except the one Grass sample, whose binormal points the other way
+and whose tangent agrees on only half its triangles. One file is too few
+to say what Grass stores there, so the exporter does not special-case
+it. It is a property of the geometry and not of cross(normal, tangent):
+an inside-out skybox and foliage with bent normals keep it, where
+Blender's MikkTSpace sign, which follows the face winding, does not. The
+exporter takes the sign from each triangle's dP/dv for that reason.
+Blender's own V runs the other way, so a bitangent passed through
+unchanged inverts every normal map's green channel, which every export
+up to 1.21.0 did.
+
+**Vertex order is part of the file.** A cloth's simulation graph, a
+weighted cloth's binding block and a rope's attachments all name
+vertices by index, and those blocks travel raw. Export keeps an imported
+mesh's vertices at the indices they came in with. Up to 1.21.0 it
+reordered every mesh past 256 vertices and split a few more, which left
+a sail's simulation pointing at the wrong vertices.
+
 **The colour channel is v8's addition.** A weighted or cinematic vertex
 gains four bytes of vertex colour in v8 and has none before it, which is
 why the same format id has two strides.
