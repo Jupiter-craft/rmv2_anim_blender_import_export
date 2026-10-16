@@ -6,8 +6,17 @@ Blender the chain is a mesh of loose vertices and edges, one vertex per
 node, so it can be edited like any other polyline; the per-node inverse
 mass and texture coordinate ride along as point attributes.  A Geometry
 Nodes modifier sweeps the same tube the game does, purely for display:
-export reads the chain off the object's own mesh, never the evaluated
-one, so the preview is never written as geometry.
+export switches it off before reading the chain, so the preview is never
+written as geometry.
+
+A rope does not hang from a bone.  Each end the file attaches names a
+particle - a vertex of one of the LOD's cloths (60) - and the game holds
+that end of the rope on it.  So in Blender an attached end is hooked to
+the cloth object, easing off along the chain to nothing at the far end:
+move a sail's skeleton and the cloth goes with it, dragging the rope.
+Export reads the hooked chain, and then puts any attached end that is
+still not on its particle there (a scene imported before the hooks, or
+a hook removed), easing the rest of the rope after it the same way.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ INV_MASS_ATTRIBUTE = "rmv2_rope_inv_mass"
 U_ATTRIBUTE = "rmv2_rope_u"
 PREVIEW_GROUP = "RMV2 Rope Preview"
 PREVIEW_MODIFIER = "Rope Preview"
+HOOK_GROUPS = ("rmv2_rope_start", "rmv2_rope_end")
 
 
 def build_mesh(name: str, rope: rf.RopeGraph, scale: float):
@@ -101,11 +111,15 @@ def add_preview(obj, radius: float) -> None:
     _radius_input(mod)[1](float(radius))
 
 
+def is_preview(mod) -> bool:
+    return (mod.type == "NODES" and mod.node_group is not None
+            and mod.node_group.name.startswith(PREVIEW_GROUP))
+
+
 def preview_radius(obj):
     """The radius set on the object's preview modifier, if it has one."""
     for mod in obj.modifiers:
-        if (mod.type == "NODES" and mod.node_group is not None
-                and mod.node_group.name.startswith(PREVIEW_GROUP)):
+        if is_preview(mod):
             try:
                 return float(_radius_input(mod)[0]())
             except (KeyError, TypeError):
@@ -161,12 +175,114 @@ def _point_floats(me, name: str):
     return values
 
 
-def read_graph(obj, scale: float, original, warnings: list):
+def falloff(positions: np.ndarray, from_start: bool) -> np.ndarray:
+    """How much of a pull on one end of the chain each node takes: all
+    of it at that end, none at the other, in between by distance along
+    the rope - so a moved end drags the rope without kinking it."""
+    segment = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+    run = np.concatenate([[0.0], np.cumsum(segment)])
+    if run[-1] > 0.0:
+        along = run / run[-1]
+    else:
+        along = np.linspace(0.0, 1.0, len(positions))
+    return 1.0 - along if from_start else along
+
+
+def _attached_ends(rope: rf.RopeGraph):
+    """(vertex, cloth, from_start) for each end hung from a cloth."""
+    for (vertex, cloth), from_start in ((rope.start_attachment, True),
+                                        (rope.end_attachment, False)):
+        if vertex >= 0 and cloth >= 0:
+            yield int(vertex), int(cloth), from_start
+
+
+def hook_to_cloths(obj, rope: rf.RopeGraph, cloth_objs: list) -> None:
+    """Hook each attached end of the rope to the cloth it hangs from.
+    `cloth_objs` are the LOD's cloths in file order, which is what the
+    attachment's cloth number counts.  Nothing moves now: the hook takes
+    the cloth's transform from here on."""
+    positions = rope.nodes["position"].astype(np.float64)
+    hooks = []
+    for vertex, cloth, from_start in _attached_ends(rope):
+        if cloth >= len(cloth_objs):
+            continue
+        target = cloth_objs[cloth]
+        group = obj.vertex_groups.new(
+            name=HOOK_GROUPS[0 if from_start else 1])
+        for k, weight in enumerate(falloff(positions, from_start)):
+            if weight > 0.0:
+                group.add([k], float(weight), "REPLACE")
+        mod = obj.modifiers.new(f"Hang from {target.name}", "HOOK")
+        mod.object = target
+        mod.vertex_group = group.name
+        mod.falloff_type = "NONE"
+        mod.strength = 1.0
+        mod.matrix_inverse = (target.matrix_world.inverted_safe()
+                              @ obj.matrix_world)
+        hooks.append(mod.name)
+    # The hooks bend the chain and the preview sweeps the bent one.
+    for k, name in enumerate(hooks):
+        obj.modifiers.move(obj.modifiers.find(name), k)
+
+
+def follow_cloths(models: list, warnings: list) -> None:
+    """Put every attached rope end in a LOD's models on its particle, as
+    written: an end left behind by a moved sail is tied to a particle
+    somewhere else, and the game's rope - its links still the old
+    lengths - hauls the sail back toward it."""
+    cloths = [m for m in models
+              if getattr(m.material, "material_id", None) == rf.MAT_CLOTH]
+    for model in models:
+        material = model.material
+        if getattr(material, "material_id", None) != rf.MAT_ROPE:
+            continue
+        rope = rf.decode_rope(getattr(material, "trailing", b""))
+        if rope is None:
+            continue
+        positions = rope.nodes["position"].astype(np.float64)
+        pulled = False
+        for vertex, cloth, from_start in _attached_ends(rope):
+            if (cloth >= len(cloths)
+                    or vertex >= cloths[cloth].mesh.vertex_count):
+                warnings.append(
+                    f"{material.model_name}: hangs from particle {vertex} "
+                    f"of cloth {cloth}, which this LOD does not have")
+                continue
+            target = cloths[cloth].mesh.positions[vertex].astype(np.float64)
+            gap = target - positions[0 if from_start else -1]
+            # The particle is written at half precision; the rope is not.
+            tolerance = max(0.02, float(np.abs(target).max()) * 2.0 ** -9)
+            distance = float(np.linalg.norm(gap))
+            if distance <= tolerance:
+                continue
+            positions += falloff(positions, from_start)[:, None] * gap
+            pulled = True
+            warnings.append(
+                f"{material.model_name}: its "
+                f"{'start' if from_start else 'end'} hangs from particle "
+                f"{vertex} of {cloths[cloth].material.model_name}, which "
+                f"is {distance:.3g} away from it, so the rope was pulled "
+                "after it. Import the file again to see ropes follow "
+                "their sails in Blender")
+        if not pulled:
+            continue
+        rope.nodes["position"] = positions
+        written = rope.nodes["position"].astype(np.float64)
+        rope.links["rest"] = np.linalg.norm(
+            written[rope.links["j"]] - written[rope.links["i"]], axis=1)
+        material.trailing = rope.write()
+        model.bbox_min = tuple((written.min(axis=0) - rope.radius).tolist())
+        model.bbox_max = tuple((written.max(axis=0) + rope.radius).tolist())
+
+
+def read_graph(obj, scale: float, original, warnings: list, me=None):
     """The rope graph to write for `obj`, or None if its mesh is not a
-    chain.  `original` is the graph it was imported with, if any: what
-    the edit left alone comes back from it exactly, so an untouched rope
+    chain.  `me` is the chain to read, the object's own mesh by default.
+    `original` is the graph it was imported with, if any: what the edit
+    left alone comes back from it exactly, so an untouched rope
     re-exports byte for byte."""
-    me = obj.data
+    if me is None:
+        me = obj.data
     count = len(me.vertices)
     co = np.empty(count * 3, np.float32)
     me.vertices.foreach_get("co", co)

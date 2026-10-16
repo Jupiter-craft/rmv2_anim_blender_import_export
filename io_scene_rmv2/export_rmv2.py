@@ -13,9 +13,10 @@ Pipeline per mesh object:
   -> bone weights resolved from vertex groups (attachment-point names,
      bone_<i> names, or armature bone order)
 
-A rope is the exception: it ships no vertices, and its object's own
-(unevaluated) vertex-and-edge chain goes into its material block instead
-- see rope.py.  The other physics blocks are rebuilt from the scene as
+A rope is the exception: it ships no vertices, and its object's
+vertex-and-edge chain (hooked to its cloth, without the tube preview)
+goes into its material block instead, each attached end then put on its
+particle - see rope.py.  The other physics blocks are rebuilt from the scene as
 well: a weighted cloth's bind matrices from the armature it is bound to,
 a cloth's rest lengths from its vertices, a collider's sphere from its
 object's transform - see cloth.py.
@@ -1068,8 +1069,8 @@ def build_model(context, obj, options, attach_points, attach_names,
 
     if (rmv2_rope.is_rope_object(obj)
             and int(options.get("version", "7")) not in rf.SHOGUN2_VERSIONS):
-        return _build_rope_model(obj, settings, options, attach_points,
-                                 warnings)
+        return _build_rope_model(context, obj, settings, options,
+                                 attach_points, warnings)
 
     arrays = extract_mesh_arrays(context, obj, options, warnings,
                                  decimate_ratio)
@@ -1279,7 +1280,7 @@ def _assemble_model(settings, material, mesh) -> rf.RmvModel:
 _ROPE_VERTEX_FORMAT = 11
 
 
-def _build_rope_model(obj, settings, options, attach_points,
+def _build_rope_model(context, obj, settings, options, attach_points,
                       warnings) -> rf.RmvModel | None:
     """A rope: no vertices, and its node chain in the material block."""
     scale = options.get("global_scale", 1.0)
@@ -1291,7 +1292,25 @@ def _build_rope_model(obj, settings, options, attach_points,
     except ValueError:
         pass
 
-    graph = rmv2_rope.read_graph(obj, scale, original, warnings)
+    # The chain as the modifiers leave it - the hooks that hang it from
+    # its cloth above all - but never the tube the preview sweeps.
+    apply_modifiers = options.get("apply_modifiers", True)
+    disabled = []
+    if apply_modifiers:
+        for mod in obj.modifiers:
+            if rmv2_rope.is_preview(mod) and mod.show_viewport:
+                mod.show_viewport = False
+                disabled.append(mod)
+    source = obj
+    try:
+        if apply_modifiers:
+            source = obj.evaluated_get(context.evaluated_depsgraph_get())
+        me = source.to_mesh()
+        graph = rmv2_rope.read_graph(obj, scale, original, warnings, me)
+    finally:
+        source.to_mesh_clear()
+        for mod in disabled:
+            mod.show_viewport = True
     if graph is None:
         warnings.append(f"{obj.name}: rope skipped")
         return None
@@ -1442,6 +1461,7 @@ def _export_lods(context, root, lods, filepath: str, options: dict):
         if not lod.models:
             raise ExportError(
                 f"LOD {info['level']}: no exportable meshes")
+        rmv2_rope.follow_cloths(lod.models, warnings)
         rmv.lods.append(lod)
 
     if any_skinned and not skeleton:

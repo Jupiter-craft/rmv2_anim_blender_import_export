@@ -4264,6 +4264,60 @@ def cloth_case(tmpdir):
           "moved: the translation is in the positions, never the pivot")
     check(not warnings, f"no warnings moving the skeletons ({warnings})")
 
+    # A rope hangs from a particle, not a bone: the end the file
+    # attaches has to stay on it, or the game's rope - still the old
+    # length - drags the sail back where it was.  The far, pinned end
+    # stays put.
+    def rope_errors(models):
+        cloths = [m for m in models.values()
+                  if m.material.material_id == rf.MAT_CLOTH]
+        gap = rest = pin = 0.0
+        hung = 0
+        for name, model in models.items():
+            if model.material.material_id != rf.MAT_ROPE:
+                continue
+            rope = rf.decode_rope(model.material.trailing)
+            old = rf.decode_rope(source[name].material.trailing)
+            pos = rope.nodes["position"].astype(np.float64)
+            rest = max(rest, np.abs(np.linalg.norm(
+                np.diff(pos, axis=0), axis=1) - rope.links["rest"]).max())
+            ends = [(rope.start_attachment, 0), (rope.end_attachment, -1)]
+            for (vertex, cloth), node in ends:
+                if cloth < 0:
+                    if (old.nodes["inv_mass"][node] == 0.0
+                            and any(c >= 0 for (_, c), _ in ends)):
+                        pin = max(pin, np.abs(
+                            pos[node] - old.nodes["position"][node]).max())
+                    continue
+                hung += 1
+                gap = max(gap, np.linalg.norm(
+                    pos[node] - cloths[cloth].mesh.positions[vertex]))
+        return hung, gap, rest, pin
+
+    hung, gap, rest, pin = rope_errors(moved)
+    check(hung == 25 and gap < 0.02,
+          f"moved: every attached rope end is on its particle "
+          f"({hung} ends, {gap:.4f})")
+    check(rest < 1e-4,
+          f"moved: rope rest lengths are the new link lengths ({rest:.6f})")
+    check(pin < 1e-5,
+          f"moved: a rope's pinned end stays where it was ({pin:.6f})")
+
+    # A rope without its hooks - a scene from before them - is still
+    # pulled after its sail on export, and said so.
+    rope_obj = bpy.data.objects["rope_mesh_12_LOD1"]
+    for mod in list(rope_obj.modifiers):
+        if mod.type == "HOOK":
+            rope_obj.modifiers.remove(mod)
+    bpy.context.view_layer.update()
+    unhooked, warnings = export("cloth_unhooked.rigid_model_v2")
+    hung, gap, rest, pin = rope_errors(unhooked)
+    check(gap < 0.02 and rest < 1e-4 and pin < 1e-5,
+          f"unhooked: the rope is pulled onto its particle on export "
+          f"({gap:.4f}, {rest:.6f}, {pin:.6f})")
+    check(len(warnings) == 1 and "rope_mesh_12_LOD1" in warnings[0],
+          f"unhooked: the pull is reported ({warnings})")
+
     # A sail grabbed on its own instead of its skeleton.
     sail = bpy.data.objects["display_dm1_misc_05"]
     sail.location = (0.0, 0.0, 1.0)

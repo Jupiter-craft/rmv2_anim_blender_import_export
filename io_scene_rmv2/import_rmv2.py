@@ -403,6 +403,7 @@ def import_file(context, filepath: str, options: dict):
 
         cloths = []
         weighted = []
+        ropes = []
         for mesh_index, model in enumerate(lod.models):
             name = model.material.model_name or f"{stem}_mesh{mesh_index}"
             if len(lods) > 1:
@@ -428,6 +429,9 @@ def import_file(context, filepath: str, options: dict):
             col.objects.link(obj)
             if model.material.material_id == rf.MAT_CLOTH:
                 cloths.append((model, obj))
+            rope = _rope_graph(model)
+            if rope is not None:
+                ropes.append((rope, obj))
             if attach_by_matrix_index and not obj.vertex_groups:
                 bone_name = bone_names.get(model.material.matrix_index)
                 if bone_name:
@@ -439,6 +443,12 @@ def import_file(context, filepath: str, options: dict):
             stats["vertices"] += model.mesh.vertex_count
             stats["triangles"] += len(model.mesh.indices) // 3
         _bind_cloths(cloths, weighted)
+        # A rope hangs from a cloth's particle, so it follows the cloth -
+        # and with it the sail's skeleton.
+        cloth_objs = [obj for _, obj in cloths]
+        context.view_layer.update()
+        for rope, obj in ropes:
+            rmv2_rope.hook_to_cloths(obj, rope, cloth_objs)
 
     scene_layout.show_only_most_detailed_lod(context, lod_collections)
 

@@ -143,7 +143,9 @@ Turn it off to write a single level, chosen with **LOD Level**. You get a warnin
 
 ### A rope is a line of points
 
-Ship rigging (`rope_mesh_*`, material `rope`) has no triangles in the file: the game sweeps a tube along a chain of simulation nodes. A rope imports as exactly that chain, one vertex per node joined by edges, with a **Rope Preview** modifier sweeping a tube the game's width so you can see it. The preview is display only; export reads the chain itself. Move, add or remove points freely, but keep it one unbranched chain, since that is all a rope can be. The ends stay attached to whatever sail or block they were attached to, and the Rope Preview's **Radius** is the rope's thickness.
+Ship rigging (`rope_mesh_*`, material `rope`) has no triangles in the file: the game sweeps a tube along a chain of simulation nodes. A rope imports as exactly that chain, one vertex per node joined by edges, with a **Rope Preview** modifier sweeping a tube the game's width so you can see it. The preview is display only; export reads the chain itself. Move, add or remove points freely, but keep it one unbranched chain, since that is all a rope can be. The Rope Preview's **Radius** is the rope's thickness.
+
+A rope end tied to a sail is tied to one of the sail's cloth particles, not to a bone. That end is hooked to the sail's `sim_*` mesh (a **Hang from …** modifier), with the pull easing off along the rope to nothing at its far end, so **moving a sail's skeleton drags its ropes with it**. On export, an attached end that is not on its particle is put there, with the rest of the rope eased after it and its lengths measured again, and export says so. That covers scenes imported before the hooks existed. Left behind, the end is tied to a particle somewhere else, and in game the rope, still its old length, hauls the sail back toward where it was.
 
 ### Sails move with their skeleton
 
