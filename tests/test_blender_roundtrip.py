@@ -4154,6 +4154,157 @@ def vertex_order_and_frame_case(tmpdir):
               f"{name}: binormals point CA's way ({share:.3f})")
 
 
+def _cloth_models(rmv):
+    return {m.material.model_name: m for m in rmv.lods[0].models}
+
+
+def _skin_local(positions, skel):
+    """(bones, vertices, 3): every vertex in every bone's space."""
+    inv_bind = skel.bones["inv_bind"].astype(np.float64)
+    pos = positions.astype(np.float64)
+    return (np.einsum("bij,vj->bvi", inv_bind[:, :, :3], pos)
+            + inv_bind[:, None, :, 3])
+
+
+def cloth_case(tmpdir):
+    """A sail moved in Blender has to move in the game too.
+
+    A weighted cloth (the drawn sail) is skinned to a skeleton of its
+    own, one bone per particle of the cloth that simulates it, and the
+    bind matrices sit in its material block in game space.  Kept raw,
+    a sail rotated in Blender was skinned from where it used to be and
+    came out jumbled; and the game ignores a physics mesh's pivot, so a
+    translation - written as the pivot - simply did not happen.
+    """
+    print("\n=== cloth: sails follow their skeleton ===")
+    sample = os.path.join(SAMPLES, "attila",
+                          "sails_light_corbita_emblem_chi_rho.rigid_model_v2")
+    if not os.path.isfile(sample):
+        print("  (skipped - sample not present)")
+        return
+    import math
+    from mathutils import Matrix
+    from io_scene_rmv2 import cloth as rmv2_cloth
+
+    options = {"source": "AUTO", "version": "6", "skeleton_name": "",
+               "apply_modifiers": True, "high_precision": True,
+               "write_attach_points": True, "global_scale": 1.0}
+
+    def export(name):
+        activate_collection(root.name)
+        dst = os.path.join(tmpdir, name)
+        _, warnings = export_rmv2.export_file(bpy.context, dst, options)
+        return _cloth_models(rf.load(open(dst, "rb").read())), warnings
+
+    reset_scene()
+    source = _cloth_models(rf.load(open(sample, "rb").read()))
+    root, _ = import_rmv2.import_file(bpy.context, sample, {
+        "import_lods": "ALL", "build_materials": False, "texture_root": "",
+        "create_attach_empties": False, "global_scale": 1.0,
+    })
+    arms = [o for o in bpy.data.objects if o.type == "ARMATURE"]
+    sims = [o for o in bpy.data.objects
+            if o.type == "MESH" and o.rmv2.material_id == "cloth"]
+    check(len(arms) == 15
+          and all(rmv2_cloth.is_cloth_skeleton(a) for a in arms),
+          "every weighted cloth gets its own skeleton")
+    check(all(rmv2_cloth.is_cloth_skeleton(o.parent) for o in sims),
+          "every cloth rides the skeleton of the sail it drives")
+
+    plain, warnings = export("cloth_plain.rigid_model_v2")
+    check(all(plain[n].material.trailing == m.material.trailing
+              for n, m in source.items()),
+          "an untouched export writes every physics block back exactly")
+    check(not warnings, f"no warnings on an untouched export ({warnings})")
+
+    # Rotate and move every skeleton, as a modder repositioning the sails.
+    move = (Matrix.Translation((1.0, 2.0, 0.5))
+            @ Matrix.Rotation(math.radians(30), 4, "Z"))
+    for arm in arms:
+        arm.matrix_world = move @ arm.matrix_world
+    bpy.context.view_layer.update()
+    moved, warnings = export("cloth_moved.rigid_model_v2")
+    conv = utils.GAME_TO_BLENDER_M3.astype(np.float64)
+    move_r = conv.T @ np.array(move.to_3x3()) @ conv
+    move_t = conv.T @ np.array(move.translation)
+    pos_err = skin_err = bone_err = 0.0
+    for name, model in source.items():
+        if model.material.material_id not in (rf.MAT_CLOTH,
+                                              rf.MAT_WEIGHTED_CLOTH):
+            continue
+        before = model.mesh.positions.astype(np.float64)
+        after = moved[name].mesh.positions.astype(np.float64)
+        pos_err = max(pos_err,
+                      np.abs(before @ move_r.T + move_t - after).max())
+        if model.material.material_id == rf.MAT_WEIGHTED_CLOTH:
+            skel_before = rf.decode_cloth_skeleton(model.material.trailing)
+            skel_after = rf.decode_cloth_skeleton(
+                moved[name].material.trailing)
+            skin_err = max(skin_err, np.abs(
+                _skin_local(before, skel_before)
+                - _skin_local(after, skel_after)).max())
+    cloths = [m for m in moved.values()
+              if m.material.material_id == rf.MAT_CLOTH]
+    sails = [m for m in moved.values()
+             if m.material.material_id == rf.MAT_WEIGHTED_CLOTH]
+    for cloth, sail in zip(cloths, sails):
+        skel = rf.decode_cloth_skeleton(sail.material.trailing)
+        bone_err = max(bone_err, np.linalg.norm(
+            rmv2_cloth.bone_origins(skel)
+            - cloth.mesh.positions[skel.bones["particle"]], axis=1).max())
+    check(pos_err < 0.01,
+          f"moved: the vertices are where the skeleton took them "
+          f"({pos_err:.4f})")
+    check(skin_err < 0.01,
+          f"moved: every sail vertex keeps its place in every bone's space "
+          f"({skin_err:.4f})")
+    check(bone_err < 0.02,
+          f"moved: every bone still sits on its particle ({bone_err:.4f})")
+    check(all(m.material.pivot == (0.0, 0.0, 0.0) for m in moved.values()),
+          "moved: the translation is in the positions, never the pivot")
+    check(not warnings, f"no warnings moving the skeletons ({warnings})")
+
+    # A sail grabbed on its own instead of its skeleton.
+    sail = bpy.data.objects["display_dm1_misc_05"]
+    sail.location = (0.0, 0.0, 1.0)
+    bpy.context.view_layer.update()
+    _, warnings = export("cloth_apart.rigid_model_v2")
+    check(any("display_dm1_misc_05" in w and "apart" in w
+              for w in warnings),
+          "a sail moved away from its skeleton is warned about")
+    sail.location = (0.0, 0.0, 0.0)
+
+    # Without its skeleton a sail still names its bones, and the
+    # object's own transform carries the bind matrices.
+    sail = bpy.data.objects["display_dm1_rigid_01"]
+    cloth = bpy.data.objects["sim_dm1_rigid_01_LOD1"]
+    for obj in (sail, cloth):
+        world = obj.matrix_world.copy()
+        obj.parent = None
+        obj.matrix_world = world
+        for mod in list(obj.modifiers):
+            if mod.type == "ARMATURE":
+                obj.modifiers.remove(mod)
+    bpy.data.objects.remove(bpy.data.objects["display_dm1_rigid_01_skeleton"])
+    for obj in (sail, cloth):
+        obj.matrix_world = move @ obj.matrix_world
+    bpy.context.view_layer.update()
+    orphan, warnings = export("cloth_orphan.rigid_model_v2")
+    out = orphan["display_dm1_rigid_01"]
+    src = source["display_dm1_rigid_01"]
+    check(out.material.vertex_format == src.material.vertex_format
+          and np.array_equal(out.mesh.bone_indices[:, 0],
+                             src.mesh.bone_indices[:, 0]),
+          "without its skeleton a sail stays skinned to the same bones")
+    err = np.abs(_skin_local(src.mesh.positions, rf.decode_cloth_skeleton(
+        src.material.trailing)) - _skin_local(
+        out.mesh.positions, rf.decode_cloth_skeleton(
+            out.material.trailing))).max()
+    check(err < 0.01,
+          f"without its skeleton the bind matrices follow the object "
+          f"({err:.4f})")
+
+
 def main():
     print(f"Blender {bpy.app.version_string}")
     io_scene_rmv2.register()
@@ -4217,6 +4368,7 @@ def main():
         rma_plain_file_case(tmpdir)
         rope_case(tmpdir)
         vertex_order_and_frame_case(tmpdir)
+        cloth_case(tmpdir)
     except Exception:
         traceback.print_exc()
         FAILURES.append("unhandled exception (see traceback)")

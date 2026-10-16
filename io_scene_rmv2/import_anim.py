@@ -100,10 +100,14 @@ def _rmv2_root_of(collection):
 
 
 def _mesh_armature(obj):
+    """The model armature a mesh is bound to.  A weighted cloth's own
+    skeleton is not one: an animation is never meant for it."""
     for mod in obj.modifiers:
-        if mod.type == "ARMATURE" and mod.object is not None:
+        if (mod.type == "ARMATURE" and mod.object is not None
+                and not skeleton.is_cloth_skeleton(mod.object)):
             return mod.object
-    if obj.parent is not None and obj.parent.type == "ARMATURE":
+    if (obj.parent is not None and obj.parent.type == "ARMATURE"
+            and not skeleton.is_cloth_skeleton(obj.parent)):
         return obj.parent
     return None
 
@@ -121,11 +125,13 @@ def find_target(context):
 
     armature = None
     active = context.active_object
-    if active is not None and active.type == "ARMATURE":
+    if (active is not None and active.type == "ARMATURE"
+            and not skeleton.is_cloth_skeleton(active)):
         armature = active
     if armature is None:
         for obj in context.selected_objects:
-            if obj.type == "ARMATURE":
+            if (obj.type == "ARMATURE"
+                    and not skeleton.is_cloth_skeleton(obj)):
                 armature = obj
                 break
 
@@ -158,7 +164,8 @@ def find_target(context):
     if armature is None:
         for root in roots.values():
             for obj in root.all_objects:
-                if obj.type == "ARMATURE":
+                if (obj.type == "ARMATURE"
+                        and not skeleton.is_cloth_skeleton(obj)):
                     armature = obj
                     break
             if armature is not None:
@@ -185,7 +192,8 @@ def _existing_armature_for_target(root_col, meshes):
             return armature
     if root_col is not None:
         for obj in root_col.all_objects:
-            if obj.type == "ARMATURE":
+            if (obj.type == "ARMATURE"
+                    and not skeleton.is_cloth_skeleton(obj)):
                 return obj
     return None
 
@@ -629,6 +637,9 @@ def rename_groups_and_attach(meshes, arm_obj, warnings,
     attached = 0
     renamed = 0
     for obj in meshes:
+        if skeleton.bound_to_cloth_skeleton(obj):
+            # A sail and its simulation ride their own skeleton.
+            continue
         if not obj.vertex_groups and obj.rmv2.matrix_index >= 0:
             bone_name = name_by_index.get(obj.rmv2.matrix_index)
             if bone_name:

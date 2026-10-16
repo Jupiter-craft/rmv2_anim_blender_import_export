@@ -145,6 +145,16 @@ Turn it off to write a single level, chosen with **LOD Level**. You get a warnin
 
 Ship rigging (`rope_mesh_*`, material `rope`) has no triangles in the file: the game sweeps a tube along a chain of simulation nodes. A rope imports as exactly that chain, one vertex per node joined by edges, with a **Rope Preview** modifier sweeping a tube the game's width so you can see it. The preview is display only; export reads the chain itself. Move, add or remove points freely, but keep it one unbranched chain, since that is all a rope can be. The ends stay attached to whatever sail or block they were attached to, and the Rope Preview's **Radius** is the rope's thickness.
 
+### Sails move with their skeleton
+
+A sail is two meshes. The `sim_*` mesh (material `cloth`) is the simulation, and its vertices are the cloth's particles. The `display_*` mesh (material `weighted_cloth`) is what you see, and it is skinned to a skeleton of its own, with one bone sitting on each particle. The game rebuilds those bones from the particles every frame.
+
+Each sail imports with that skeleton as an armature, `display_…_skeleton`. The display mesh is bound to it, and the sim mesh is parented to it. **To move, rotate or scale a sail, transform its armature**, and both meshes follow. Export writes the bones' new bind matrices and the cloth's new rest lengths.
+
+Grabbing just one of the meshes pulls the sail apart from its own simulation, and in game it tears and jumbles as the cloth moves. Export warns when that has happened; clearing that mesh's location, rotation and scale (`Alt+G`, `Alt+R`, `Alt+S`) puts it back on its skeleton. Don't move individual bones in Edit Mode: each one has to stay on its particle.
+
+The game ignores the pivot of sails, ropes and collision spheres, so for those the whole transform is written into the positions.
+
 ## Collections are "the model"
 
 This is the bit that trips up people used to a flatter Blender scene: the add-on treats **collections**, not loose objects, as the real unit.

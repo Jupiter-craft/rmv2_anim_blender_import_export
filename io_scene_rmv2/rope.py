@@ -180,11 +180,13 @@ def read_graph(obj, scale: float, original, warnings: list):
             f"{len(me.edges)} edges)")
         return None
 
-    # Rotation and scale go into the positions; the translation is the
-    # pivot, written separately, exactly as for a mesh's vertices.
-    m3 = np.array(obj.matrix_world, np.float64)[:3, :3]
+    # The whole transform goes into the positions.  The game ignores a
+    # rope's pivot, like every physics material's, so the export writes
+    # it as zero and the translation has to be here.
+    mw = np.array(obj.matrix_world, np.float64)
     positions = utils.blender_to_game(
-        (co.reshape(-1, 3).astype(np.float64) @ m3.T)) * scale
+        co.reshape(-1, 3).astype(np.float64) @ mw[:3, :3].T
+        + mw[:3, 3]) * scale
     positions = positions[order].astype(np.float32)
 
     inv_mass = _point_floats(me, INV_MASS_ATTRIBUTE)

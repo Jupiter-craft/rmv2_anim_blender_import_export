@@ -16,6 +16,23 @@ from . import utils
 
 BONE_INDEX_PROP = "rmv2_bone_index"
 BONE_FIX_QUAT_PROP = "rmv2_bone_fix_quat"
+# Stamped on the armature data of a weighted cloth's own skeleton (see
+# cloth.py), so the searches for "the model's armature" pass it over: a
+# sail's skeleton is not the one the model animates with.
+CLOTH_SKELETON_PROP = "rmv2_cloth_skeleton"
+
+
+def is_cloth_skeleton(obj) -> bool:
+    return (obj is not None and obj.type == "ARMATURE"
+            and bool(obj.data.get(CLOTH_SKELETON_PROP)))
+
+
+def bound_to_cloth_skeleton(obj) -> bool:
+    """Whether `obj` is a weighted cloth or a cloth that the importer
+    bound to a cloth skeleton."""
+    return is_cloth_skeleton(obj.parent) or any(
+        mod.type == "ARMATURE" and is_cloth_skeleton(mod.object)
+        for mod in obj.modifiers)
 
 
 def fallback_bone_name(index: int) -> str:
@@ -105,18 +122,21 @@ def find_context_armature(context):
     one, otherwise the first selected armature, otherwise the armature a
     selected mesh is attached to."""
     obj = context.active_object
-    if obj is not None and obj.type == "ARMATURE":
+    if (obj is not None and obj.type == "ARMATURE"
+            and not is_cloth_skeleton(obj)):
         return obj
     for obj in context.selected_objects:
-        if obj.type == "ARMATURE":
+        if obj.type == "ARMATURE" and not is_cloth_skeleton(obj):
             return obj
     for obj in context.selected_objects:
         if obj.type != "MESH":
             continue
         for mod in obj.modifiers:
-            if mod.type == "ARMATURE" and mod.object is not None:
+            if (mod.type == "ARMATURE" and mod.object is not None
+                    and not is_cloth_skeleton(mod.object)):
                 return mod.object
-        if obj.parent is not None and obj.parent.type == "ARMATURE":
+        if (obj.parent is not None and obj.parent.type == "ARMATURE"
+                and not is_cloth_skeleton(obj.parent)):
             return obj.parent
     return None
 

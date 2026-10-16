@@ -1130,6 +1130,118 @@ class TestRope(unittest.TestCase):
             self.assertEqual(graph.write(), model.material.trailing)
 
 
+SAIL_SAMPLE = os.path.join(os.path.dirname(__file__), "..", "samples",
+                           "attila",
+                           "sails_light_corbita_emblem_chi_rho.rigid_model_v2")
+
+
+class TestClothBlocks(unittest.TestCase):
+    """A cloth's simulation graph, a weighted cloth's skeleton and a
+    collision shape's sphere."""
+
+    @staticmethod
+    def cloth_block(p=3):
+        edges = np.zeros(3, rf._CLOTH_EDGE)
+        edges["i"] = (1, 1, 2)
+        edges["j"] = (2, 0, 0)
+        edges["rest"] = (1.5, 2.25, 1.25)
+        return (struct.pack("<3I", 3, p, 1) + edges.tobytes()
+                + np.ones(p, "<u4").tobytes()
+                + np.array([0, 2, 1], "<u4").tobytes())
+
+    @staticmethod
+    def skeleton_block(n=2):
+        bones = np.zeros(n, rf._CLOTH_BONE)
+        for k in range(n):
+            # junk after the terminator, as CA's fields keep it
+            bones["name"][k] = np.void(
+                f"bone_{k:02d}".encode("utf-16-le").ljust(30, b"\0")
+                + b"\x31\x00")
+            bones["inv_bind"][k] = [[1, 0, 0, -k], [0, 1, 0, 0],
+                                    [0, 0, 1, 0]]
+            bones["parent"][k] = -1
+            bones["particle"][k] = n - 1 - k
+        return struct.pack("<2I", n, 0) + bones.tobytes()
+
+    def test_cloth_decodes_and_writes_back(self):
+        blob = self.cloth_block()
+        graph = rf.decode_cloth(blob)
+        self.assertIsNotNone(graph)
+        self.assertEqual(graph.particle_count, 3)
+        self.assertEqual(graph.triangles.tolist(), [[0, 2, 1]])
+        self.assertEqual(graph.write(), blob)
+
+    def test_cloth_naming_a_missing_particle_is_refused(self):
+        self.assertIsNone(rf.decode_cloth(self.cloth_block(p=2)[:-4]))
+        self.assertIsNone(rf.decode_cloth(self.cloth_block() + b"\0"))
+
+    def test_skeleton_decodes_and_writes_back(self):
+        blob = self.skeleton_block()
+        skel = rf.decode_cloth_skeleton(blob)
+        self.assertIsNotNone(skel)
+        self.assertEqual(skel.bone_name(1), "bone_01")
+        self.assertEqual(skel.bones["particle"].tolist(), [1, 0])
+        self.assertEqual(skel.write(), blob)
+        self.assertIsNone(rf.decode_cloth_skeleton(blob + b"\0"))
+
+    def test_an_unchanged_bone_name_keeps_its_junk(self):
+        raw = bytes(rf.decode_cloth_skeleton(
+            self.skeleton_block()).bones["name"][0])
+        self.assertEqual(rf.encode_cloth_bone_name("bone_00", raw), raw)
+        renamed = rf.encode_cloth_bone_name("sail", raw)
+        self.assertEqual(len(renamed), 32)
+        self.assertEqual(renamed, "sail".encode("utf-16-le").ljust(32, b"\0"))
+
+    def test_sphere_collider(self):
+        blob = struct.pack("<I4f", 0, 1.0, 2.0, 3.0, 0.5)
+        sphere = rf.decode_sphere_collider(blob)
+        self.assertEqual(sphere.centre, (1.0, 2.0, 3.0))
+        self.assertEqual(sphere.write(), blob)
+        self.assertIsNone(rf.decode_sphere_collider(blob + b"\0"))
+
+    def test_the_sails(self):
+        """Every block in a real file decodes and writes back exactly, and
+        the k-th weighted cloth is skinned to the k-th cloth: one bone per
+        particle, each bone sitting on its particle."""
+        if not os.path.isfile(SAIL_SAMPLE):
+            self.skipTest("sample not present")
+        with open(SAIL_SAMPLE, "rb") as handle:
+            models = rf.load(handle.read()).lods[0].models
+        decoders = {rf.MAT_WEIGHTED_CLOTH: rf.decode_cloth_skeleton,
+                    rf.MAT_CLOTH: rf.decode_cloth,
+                    rf.MAT_COLLISION_SHAPE: rf.decode_sphere_collider,
+                    rf.MAT_ROPE: rf.decode_rope}
+        for model in models:
+            block = model.material.trailing
+            decoded = decoders[model.material.material_id](block)
+            self.assertIsNotNone(decoded, model.material.model_name)
+            self.assertEqual(decoded.write(), block)
+            self.assertEqual(model.material.pivot, (0.0, 0.0, 0.0))
+
+        cloths = [m for m in models
+                  if m.material.material_id == rf.MAT_CLOTH]
+        weighted = [m for m in models
+                    if m.material.material_id == rf.MAT_WEIGHTED_CLOTH]
+        self.assertEqual(len(cloths), len(weighted))
+        for cloth, display in zip(cloths, weighted):
+            graph = rf.decode_cloth(cloth.material.trailing)
+            skel = rf.decode_cloth_skeleton(display.material.trailing)
+            p = graph.particle_count
+            self.assertEqual(sorted(skel.bones["particle"].tolist()),
+                             list(range(p)))
+            frames = np.tile(np.eye(4), (len(skel.bones), 1, 1))
+            frames[:, :3, :] = skel.bones["inv_bind"]
+            origins = np.linalg.inv(frames)[:, :3, 3]
+            gaps = np.linalg.norm(
+                origins - cloth.mesh.positions[skel.bones["particle"]],
+                axis=1)
+            self.assertLess(gaps.max(), 0.01, display.material.model_name)
+            self.assertLess(int(display.mesh.bone_indices.max()), p)
+            # double sided: vertex i + p is a copy of vertex i
+            np.testing.assert_array_equal(cloth.mesh.positions[:p],
+                                          cloth.mesh.positions[p:2 * p])
+
+
 class TestAnimRoundtrip(unittest.TestCase):
     def check(self, version, **kwargs):
         anim = make_anim(version=version, **kwargs)

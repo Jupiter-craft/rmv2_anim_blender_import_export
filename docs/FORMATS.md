@@ -290,13 +290,69 @@ and the decal family runs 67, then 87, then 95 — so dispatch goes by id
 | No header at all | bow waves, one terrain-tile id | Straight from the common header to the vertices, so the vertex layout comes from the stride |
 
 **Cloth, weighted cloth, collision shapes and rope** (ids 58, 60, 62, 93)
-are an ordinary weighted material followed by a block of their own: for
-cloth a simulation graph — a count, then triples of two vertex indices
-and a rest length — and for a collision shape twenty bytes. Nothing in
-Blender could rebuild either, so the block is kept exactly as read and
-written back with its material. The allowance is limited to those four
-ids; anywhere else, a material that does not consume its declared size
-stays a parse error.
+are an ordinary weighted material followed by a block of their own,
+each decoded below. A block that does not fit its layout is kept
+exactly as read and written back with its material. The allowance is
+limited to those four ids; anywhere else, a material that does not
+consume its declared size stays a parse error.
+
+**The game ignores the pivot of all four.** They are simulated in the
+model's space straight from their positions, and every vanilla one has
+a zero pivot. Export therefore bakes an object's whole transform into
+the positions (and every block below) and writes the pivot as zero; a
+translation written as the pivot, which is what export did up to
+1.21.1, is a move the game never makes.
+
+**A cloth (60) is the simulation.** Its particles are the mesh's own
+vertices — particle *i* is vertex *i*, and every cloth seen is double
+sided, vertex *i* + *p* a copy of vertex *i*. The block connects them:
+
+| Field | Type | |
+| --- | --- | --- |
+| edge count *e* | u32 | |
+| particle count *p* | u32 | |
+| triangle count *t* | u32 | |
+| edges × *e* | u32 i, u32 j, f32 rest length | rest length as authored |
+| particles × *p* | u32 | 1 to 7; not yet read |
+| triangles × *t* | u32 a, b, c | |
+
+The rest lengths agree with the half-precision vertices to within that
+precision (0.013 at worst on a corbita's sails) and no closer. Export
+measures an edge again only when it has moved by more than that, so an
+untouched cloth writes the file's numbers.
+
+**A weighted cloth (58) is what the game draws**, and it is skinned —
+but not to the model's skeleton. The block is a skeleton of its own, one
+bone per particle of the cloth that drives it; the *k*-th weighted
+cloth in a LOD goes with the *k*-th cloth:
+
+| Field | Type | |
+| --- | --- | --- |
+| bone count *n* | u32 | equals the cloth's particle count |
+| unknown | u32 | 0 |
+| bones × *n*, 124 bytes each: | | |
+| &nbsp;&nbsp;name | 32 bytes, UTF-16 | `bone_misc_05_01` |
+| &nbsp;&nbsp;unknown | f32 × 3 | 100, 200, 400 everywhere |
+| &nbsp;&nbsp;unknown | u32 × 5 | 12, 64, a per-mesh value, then 24 or 25 twice |
+| &nbsp;&nbsp;unknown | f32 | 1.0 or 0.0 |
+| &nbsp;&nbsp;inverse bind matrix | f32 × 12 | 3×4 row major, game → bone |
+| &nbsp;&nbsp;parent | i32 | −1: the skeleton is flat |
+| &nbsp;&nbsp;particle | u32 | the cloth particle the bone rides on |
+
+Every bone's origin sits on its particle to half precision, with its Y
+axis along the cloth's normal; the particles are a permutation of the
+cloth's. The game rebuilds each bone from its particle as the cloth
+moves and skins the drawn mesh with these bind matrices, so they have to
+move with the mesh. Kept raw, a sail rotated in Blender was skinned from
+where it used to be, and came apart as soon as the cloth moved. In
+Blender the skeleton is an armature the sail is bound to and its cloth
+is parented to; export reads the bind matrices back off the bones' rest
+pose, keeping the file's own bytes for a bone that has not moved.
+
+**A collision shape (62)** carries a sphere: a u32 (0), the centre as
+f32 × 3 in the same space as the vertices, and the radius. The mesh is
+a rough sphere drawn round it. Export carries the centre and radius by
+the object's transform.
 
 **A rope's block is its geometry.** A rope declares vertex format 11
 and ships no vertices; the game sweeps a twelve-sided tube along a
@@ -367,8 +423,8 @@ unchanged inverts every normal map's green channel, which every export
 up to 1.21.0 did.
 
 **Vertex order is part of the file.** A cloth's simulation graph, a
-weighted cloth's binding block and a rope's attachments all name
-vertices by index, and those blocks travel raw. Export keeps an imported
+weighted cloth's skeleton and a rope's attachments all name vertices by
+index. Export keeps an imported
 mesh's vertices at the indices they came in with. Up to 1.21.0 it
 reordered every mesh past 256 vertices and split a few more, which left
 a sail's simulation pointing at the wrong vertices.

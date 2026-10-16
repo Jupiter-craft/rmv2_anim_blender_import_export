@@ -6,14 +6,19 @@ Pipeline per mesh object:
   -> per-loop position/normal/tangent/uv/colour gathered with numpy
   -> rotation/scale of the world transform baked in (the translation is
      written as the material pivot; the game adds it back at render time),
-     then converted to game space
+     then converted to game space.  The physics materials are the
+     exception: the game ignores their pivot, so their translation is
+     baked in too and the pivot written as zero
   -> quantized to file precision and welded into unique vertices
   -> bone weights resolved from vertex groups (attachment-point names,
      bone_<i> names, or armature bone order)
 
 A rope is the exception: it ships no vertices, and its object's own
 (unevaluated) vertex-and-edge chain goes into its material block instead
-- see rope.py.
+- see rope.py.  The other physics blocks are rebuilt from the scene as
+well: a weighted cloth's bind matrices from the armature it is bound to,
+a cloth's rest lengths from its vertices, a collider's sphere from its
+object's transform - see cloth.py.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import re
 import bpy
 import numpy as np
 
+from . import cloth as rmv2_cloth
 from . import mesh_build
 from . import rmv2_format as rf
 from . import rope as rmv2_rope
@@ -348,7 +354,8 @@ def load_attach_points(root_collection, objects):
             for entry in root_collection.rmv2.attach_points]
     for obj in objects:
         armature = _find_armature(obj)
-        if armature is not None:
+        if armature is not None and not rmv2_cloth.is_cloth_skeleton(
+                armature):
             return [rf.RmvAttachmentPoint(
                 name=(b.name[3:] if b.name.startswith("bn_") else b.name),
                 bone_index=i, matrix=rf.IDENTITY_3X4)
@@ -365,6 +372,10 @@ def resolve_bone_map(obj, attach_names: dict, warnings: list) -> dict:
             bone_order[bone.name] = i
             if bone.name.startswith("bn_"):
                 bone_order.setdefault(bone.name[3:], i)
+    else:
+        # A weighted cloth whose armature is gone still names its own
+        # skeleton, in the block it was imported with.
+        bone_order = _cloth_bone_order(obj.rmv2)
 
     mapping = {}
     unmapped = []
@@ -402,6 +413,24 @@ def resolve_bone_map(obj, attach_names: dict, warnings: list) -> dict:
         for gi in bad:
             del mapping[gi]
     return mapping
+
+
+def _cloth_bone_order(settings) -> dict:
+    """{bone name: index} from a weighted cloth's stored skeleton."""
+    if not _is_physics(settings):
+        return {}
+    try:
+        block = bytes.fromhex(_extra_data(settings).get(
+            "material_trailing", ""))
+    except ValueError:
+        return {}
+    skel = rf.decode_cloth_skeleton(block)
+    if skel is None:
+        return {}
+    order = {}
+    for k in range(len(skel.bones)):
+        order.setdefault(skel.bone_name(k), k)
+    return order
 
 
 def _gather_weights(me, bone_map: dict, k: int, obj_name: str,
@@ -646,12 +675,16 @@ def extract_mesh_arrays(context, obj, options, warnings,
         # here would apply the bone's transform a second time. The
         # object's own local matrix is what belongs in the file, and the
         # translation is baked into the vertices for want of a pivot.
+        #
+        # The physics materials go the same way for another reason: the
+        # game ignores their pivot, so their translation has nowhere to
+        # go but the vertices (see rf.PHYSICS_MATERIAL_IDS).
         bone_local = options.get("bone_local_space", False)
         mw = np.array(obj.matrix_basis if bone_local else obj.matrix_world,
                       dtype=np.float64)
         m3 = mw[:3, :3]
         positions_w = positions @ m3.T
-        if bone_local:
+        if bone_local or _is_physics(obj.rmv2):
             positions_w = positions_w + mw[:3, 3]
         det = float(np.linalg.det(m3))
         if abs(det) < 1e-12:
@@ -847,6 +880,13 @@ def _resolve_material_id(settings, fmt: int) -> int:
     return rf.MATERIAL_IDS.get(settings.material_id, rf.MAT_DEFAULT)
 
 
+def _is_physics(settings) -> bool:
+    """Cloth, weighted cloth, collision shape or rope.  None of them is
+    ever what Auto resolves to, so the format does not matter here."""
+    return (settings.material_id != "AUTO" and _resolve_material_id(
+        settings, rf.VF_STATIC) in rf.PHYSICS_MATERIAL_IDS)
+
+
 def _resolve_matrix_index(obj, settings) -> int:
     """The bone/matrix a piece is attached to. Prefers the LIVE Child Of
     constraint (skeleton.attach_to_bone, destructible-building pieces) over
@@ -960,6 +1000,8 @@ def _material_from_settings(obj, settings, fmt: int, scale: float,
             return short
 
     pivot_b = obj.matrix_world.translation
+    if _is_physics(settings):
+        pivot_b = (0.0, 0.0, 0.0)       # in the positions instead
     mat = rf.WeightedMaterial(
         material_id=_resolve_material_id(settings, fmt),
         vertex_format=fmt,
@@ -1148,9 +1190,41 @@ def build_model(context, obj, options, attach_points, attach_names,
 
         material = _material_from_settings(obj, settings, fmt, scale,
                                            attach_points, options)
+        if int(options.get("version", "7")) not in rf.SHOGUN2_VERSIONS:
+            _rebuild_physics_block(obj, material, mesh.positions, scale,
+                                   warnings)
         return _assemble_model(settings, material, mesh)
     finally:
         arrays["source_object"].to_mesh_clear()
+
+
+def _rebuild_physics_block(obj, material, positions, scale: float,
+                           warnings: list) -> None:
+    """Bring a physics material's block up to date with the scene.  Each
+    of these is in the same space as the vertices, so kept as imported
+    it stays where the file had it while the mesh moves.  A block whose
+    layout is not known is left as it was."""
+    block = getattr(material, "trailing", b"")
+    mid = material.material_id
+    if not block:
+        return
+    if mid in (rf.MAT_WEIGHTED_CLOTH, rf.MAT_CLOTH):
+        rmv2_cloth.warn_if_moved_apart(obj, warnings)
+    if mid == rf.MAT_WEIGHTED_CLOTH:
+        skel = rf.decode_cloth_skeleton(block)
+        if skel is not None:
+            material.trailing = rmv2_cloth.write_skeleton(
+                obj, skel, scale, warnings).write()
+    elif mid == rf.MAT_CLOTH:
+        graph = rf.decode_cloth(block)
+        if graph is not None:
+            material.trailing = rmv2_cloth.write_cloth(
+                graph, positions, obj.name, warnings).write()
+    elif mid == rf.MAT_COLLISION_SHAPE:
+        sphere = rf.decode_sphere_collider(block)
+        if sphere is not None:
+            material.trailing = rmv2_cloth.write_collider(
+                sphere, obj, _extra_data(obj.rmv2), scale).write()
 
 
 def _extra_data(settings) -> dict:
@@ -1357,8 +1431,12 @@ def _export_lods(context, root, lods, filepath: str, options: dict):
                 built_cache[cache_key] = model
             if model is None:
                 continue
-            if model.material.vertex_format in (rf.VF_WEIGHTED,
-                                                rf.VF_CINEMATIC):
+            if (model.material.vertex_format in (rf.VF_WEIGHTED,
+                                                 rf.VF_CINEMATIC)
+                    and model.material.material_id
+                    != rf.MAT_WEIGHTED_CLOTH):
+                # A weighted cloth's skeleton is its own, not the
+                # model's, so it needs no skeleton name.
                 any_skinned = True
             lod.models.append(model)
         if not lod.models:

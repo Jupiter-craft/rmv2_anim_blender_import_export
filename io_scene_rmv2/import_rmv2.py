@@ -25,6 +25,11 @@ material's matrix_index bone via a Child Of constraint (destructible
 -building pieces - genuinely unrigged, so no vertex groups/armature
 modifier are involved) - see `attach_by_matrix_index` and
 `skeleton.attach_to_bone`.
+
+A weighted cloth (a sail) is the exception to all of that: it is skinned
+to a skeleton of its own, carried in its material block, which becomes
+an armature of its own in the LOD collection, with the cloth that drives
+it parented to it as well - see cloth.py.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix
 
+from . import cloth as rmv2_cloth
 from . import materials as rmv2_materials
 from . import mesh_build
 from . import rmv2_format as rf
@@ -233,6 +239,7 @@ def _build_mesh_object(model, version: int, name: str, scale: float,
     _fill_object_settings(obj, model, material)
     if rope is not None:
         rmv2_rope.add_preview(obj, rope.radius * scale)
+    _store_collider(obj, material, scale, pivot_b)
 
     if options.get("build_materials", True):
         alpha = obj.rmv2.alpha_mode
@@ -242,6 +249,46 @@ def _build_mesh_object(model, version: int, name: str, scale: float,
         me.materials.append(bmat)
 
     return obj
+
+
+def _store_collider(obj, material, scale: float, pivot_b) -> None:
+    """A collision shape's sphere, in the object's own space, so export
+    can carry it wherever the object has been moved since."""
+    if material.material_id != rf.MAT_COLLISION_SHAPE:
+        return
+    sphere = rf.decode_sphere_collider(getattr(material, "trailing", b""))
+    if sphere is None:
+        return
+    extra = json.loads(obj.rmv2.extra_json) if obj.rmv2.extra_json else {}
+    centre = np.array(utils.game_to_blender_v(sphere.centre)) * scale
+    extra["collider_centre"] = (centre - pivot_b).tolist()
+    extra["collider_radius"] = float(sphere.radius) * scale
+    obj.rmv2.extra_json = json.dumps(extra)
+
+
+def _cloth_skeleton(model):
+    """The skeleton a weighted cloth is skinned to, carried in its own
+    material block rather than named by the file."""
+    material = model.material
+    if material.material_id != rf.MAT_WEIGHTED_CLOTH:
+        return None
+    return rf.decode_cloth_skeleton(getattr(material, "trailing", b""))
+
+
+def _bind_cloths(cloths, weighted) -> None:
+    """Parent each cloth to the skeleton of the weighted cloth it drives,
+    so moving the armature moves the simulation with what it draws.  The
+    k-th of each go together; the bones are checked against the
+    particles, and a pair that does not line up is left alone."""
+    for (cloth_model, cloth_obj), (skel, arm_obj) in zip(cloths, weighted):
+        if arm_obj is None:
+            continue
+        graph = rf.decode_cloth(getattr(cloth_model.material, "trailing",
+                                        b""))
+        if graph is None or not rmv2_cloth.drives(
+                skel, graph, cloth_model.mesh.positions):
+            continue
+        rmv2_cloth.parent_keep_transform(cloth_obj, arm_obj)
 
 
 def _attach_matrix_to_blender(matrix12, scale: float) -> Matrix:
@@ -354,13 +401,33 @@ def import_file(context, filepath: str, options: dict):
         col.rmv2.quality_level = lod.quality_level
         stats["lods"] += 1
 
+        cloths = []
+        weighted = []
         for mesh_index, model in enumerate(lod.models):
             name = model.material.model_name or f"{stem}_mesh{mesh_index}"
             if len(lods) > 1:
                 name = f"{name}_lod{lod_index}"
+            cloth_skeleton = _cloth_skeleton(model)
+            if cloth_skeleton is not None:
+                # Its bone indices are into its own skeleton, never the
+                # model's - so not the selected armature's names either.
+                arm_obj = rmv2_cloth.build_armature(
+                    context, f"{name}_skeleton", cloth_skeleton, scale, col)
+                obj = _build_mesh_object(
+                    model, rmv.version, name, scale,
+                    skeleton.bone_name_by_index(arm_obj), options)
+                col.objects.link(obj)
+                skeleton.attach_mesh(obj, arm_obj)
+                weighted.append((cloth_skeleton, arm_obj))
+                stats["meshes"] += 1
+                stats["vertices"] += model.mesh.vertex_count
+                stats["triangles"] += len(model.mesh.indices) // 3
+                continue
             obj = _build_mesh_object(model, rmv.version, name, scale,
                                      bone_names, options)
             col.objects.link(obj)
+            if model.material.material_id == rf.MAT_CLOTH:
+                cloths.append((model, obj))
             if attach_by_matrix_index and not obj.vertex_groups:
                 bone_name = bone_names.get(model.material.matrix_index)
                 if bone_name:
@@ -371,6 +438,7 @@ def import_file(context, filepath: str, options: dict):
             stats["meshes"] += 1
             stats["vertices"] += model.mesh.vertex_count
             stats["triangles"] += len(model.mesh.indices) // 3
+        _bind_cloths(cloths, weighted)
 
     scene_layout.show_only_most_detailed_lod(context, lod_collections)
 

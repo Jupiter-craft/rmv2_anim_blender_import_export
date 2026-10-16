@@ -191,7 +191,9 @@ MAT_CUSTOM_TERRAIN = 49
 MAT_TERRAIN_TILES = 101
 MAT_WEIGHTED = 65
 MAT_DEFAULT = 68
+MAT_WEIGHTED_CLOTH = 58
 MAT_CLOTH = 60
+MAT_COLLISION_SHAPE = 62
 MAT_ROPE = 93
 
 # TextureType
@@ -1618,14 +1620,19 @@ _DECAL_IDS = (67, 87, 95, 100)
 
 # Cloth, weighted cloth, rope and collision shapes are an ordinary
 # weighted material followed by a block of their own: for cloth and rope
-# a simulation graph (a count, then triples of two vertex indices and a
-# rest length, then more), for a collision shape twenty bytes.  Neither is decoded -
-# nothing in Blender could rebuild them - so the block is kept as it was
-# read and written back with the material it belongs to.  The allowance
-# is deliberately limited to these ids: anywhere else, a material that
-# does not consume its declared size is a parse error and should stay
-# one.
-_TRAILING_BLOCK_IDS = (58, 60, 62, 93)
+# a simulation graph, for weighted cloth the skeleton it is skinned to,
+# for a collision shape a sphere.  Each is decoded below where its layout
+# is known, and kept as it was read where it is not.  The allowance is
+# deliberately limited to these ids: anywhere else, a material that does
+# not consume its declared size is a parse error and should stay one.
+_TRAILING_BLOCK_IDS = (MAT_WEIGHTED_CLOTH, MAT_CLOTH, MAT_COLLISION_SHAPE,
+                       MAT_ROPE)
+
+# The physics family.  All of them are simulated in the model's own
+# space, which the game takes from the positions alone: it ignores the
+# pivot of every one of these, so a pivot written for them is a move the
+# game never makes.  Every vanilla one has a zero pivot.
+PHYSICS_MATERIAL_IDS = _TRAILING_BLOCK_IDS
 
 # The 3D interface banners: a name and eight zero words, nothing else.
 # See NamedMaterial.
@@ -1690,6 +1697,156 @@ def decode_rope(block: bytes) -> Optional[RopeGraph]:
         return None
     return RopeGraph(nodes=nodes, links=links, start_attachment=(sv, sc),
                      end_attachment=(ev, ec), radius=radius, unknown=unknown)
+
+
+# A cloth (60) is the simulation: its particles are the mesh's own
+# vertices, and the block after the material holds what connects them.
+#
+#     u32       edge count e
+#     u32       particle count p
+#     u32       triangle count t
+#     e x       u32 i, u32 j, f32 rest length
+#     p x       u32 per-particle word (1 to 7; not yet read)
+#     t x       u32 a, b, c
+#
+# A particle is vertex i of the mesh, for i < p.  Every cloth seen is
+# double sided, with vertex i + p a copy of vertex i.  The rest lengths
+# are the edge lengths as authored, so they agree with the half-precision
+# vertices to within that precision and no closer.
+_CLOTH_HEADER = struct.Struct("<3I")
+_CLOTH_EDGE = np.dtype([("i", "<u4"), ("j", "<u4"), ("rest", "<f4")])
+
+
+@dataclass
+class ClothGraph:
+    edges: np.ndarray        # (e,) _CLOTH_EDGE
+    particle_words: np.ndarray  # (p,) u32
+    triangles: np.ndarray    # (t, 3) u32
+
+    @property
+    def particle_count(self) -> int:
+        return len(self.particle_words)
+
+    def write(self) -> bytes:
+        return (_CLOTH_HEADER.pack(len(self.edges), len(self.particle_words),
+                                   len(self.triangles))
+                + self.edges.astype(_CLOTH_EDGE).tobytes()
+                + self.particle_words.astype("<u4").tobytes()
+                + self.triangles.astype("<u4").tobytes())
+
+
+def decode_cloth(block: bytes) -> Optional[ClothGraph]:
+    """A cloth material's trailing block, or None when it is not laid out
+    as one - it is then simply kept as read."""
+    if len(block) < _CLOTH_HEADER.size:
+        return None
+    e, p, t = _CLOTH_HEADER.unpack_from(block)
+    if p == 0 or len(block) != (_CLOTH_HEADER.size + e * _CLOTH_EDGE.itemsize
+                                + p * 4 + t * 12):
+        return None
+    at = _CLOTH_HEADER.size
+    edges = np.frombuffer(block, _CLOTH_EDGE, e, at).copy()
+    at += e * _CLOTH_EDGE.itemsize
+    words = np.frombuffer(block, "<u4", p, at).copy()
+    at += p * 4
+    tris = np.frombuffer(block, "<u4", t * 3, at).reshape(t, 3).copy()
+    if e and max(int(edges["i"].max()), int(edges["j"].max())) >= p:
+        return None
+    if t and int(tris.max()) >= p:
+        return None
+    return ClothGraph(edges=edges, particle_words=words, triangles=tris)
+
+
+# A weighted cloth (58) is what the game draws: an ordinary skinned mesh
+# whose skeleton is not the model's but its own, one bone per particle of
+# the cloth that drives it.  The k-th weighted cloth in a LOD goes with
+# the k-th cloth.  The block after the material is that skeleton:
+#
+#     u32       bone count n
+#     u32       unknown (0)
+#     n x 124   bone:
+#         32    name, UTF-16, zero padded
+#         f32 x 3   unknown (100, 200, 400 in every one seen)
+#         u32 x 5   unknown (12, 64, a per-mesh value, 24 or 25 twice)
+#         f32       unknown (1.0 or 0.0)
+#         f32 x 12  inverse bind matrix, 3x4 row major: game -> bone
+#         i32       parent (-1: the skeleton is flat)
+#         u32       the cloth particle the bone rides on
+#
+# Each bone's origin sits on its particle to half precision, with its Y
+# axis along the cloth's normal.  The bind matrices are in the same space
+# as the vertices, and that is the whole reason they matter: a weighted
+# cloth moved without its bind matrices moving with it is skinned from
+# where it was to where the particles are, which is not where it now is.
+_CLOTH_BONE = np.dtype([
+    ("name", "V32"), ("unknown_f", "<f4", (3,)), ("unknown_u", "<u4", (5,)),
+    ("unknown_flag", "<f4"), ("inv_bind", "<f4", (3, 4)),
+    ("parent", "<i4"), ("particle", "<u4"),
+])
+_CLOTH_SKELETON_HEADER = struct.Struct("<2I")
+_CLOTH_BONE_NAME_BYTES = 32
+
+
+@dataclass
+class ClothSkeleton:
+    bones: np.ndarray        # (n,) _CLOTH_BONE
+    unknown: int = 0
+
+    def bone_name(self, index: int) -> str:
+        return _decode_fixed_utf16(bytes(self.bones["name"][index]))
+
+    def write(self) -> bytes:
+        return (_CLOTH_SKELETON_HEADER.pack(len(self.bones), self.unknown)
+                + self.bones.astype(_CLOTH_BONE).tobytes())
+
+
+def decode_cloth_skeleton(block: bytes) -> Optional[ClothSkeleton]:
+    """A weighted cloth's trailing block, or None when it is not laid out
+    as a skeleton - it is then simply kept as read."""
+    if len(block) < _CLOTH_SKELETON_HEADER.size:
+        return None
+    n, unknown = _CLOTH_SKELETON_HEADER.unpack_from(block)
+    if n == 0 or len(block) != (_CLOTH_SKELETON_HEADER.size
+                                + n * _CLOTH_BONE.itemsize):
+        return None
+    bones = np.frombuffer(block, _CLOTH_BONE, n,
+                          _CLOTH_SKELETON_HEADER.size).copy()
+    if not np.isfinite(bones["inv_bind"]).all():
+        return None
+    return ClothSkeleton(bones=bones, unknown=unknown)
+
+
+def encode_cloth_bone_name(name: str, raw: bytes) -> bytes:
+    """`name` as a bone's 32-byte field; `raw` comes back untouched while
+    it still says the same thing, junk after the terminator and all."""
+    if _decode_fixed_utf16(raw) == name:
+        return raw
+    return _encode_fixed_utf16(name, _CLOTH_BONE_NAME_BYTES)
+
+
+# A collision shape (62) carries its sphere after the material: a word,
+# the centre in the same space as the vertices, and the radius.  The mesh
+# is a rough sphere drawn around it, not the shape itself.
+_SPHERE_COLLIDER = struct.Struct("<I4f")
+
+
+@dataclass
+class SphereCollider:
+    centre: tuple
+    radius: float
+    unknown: int = 0
+
+    def write(self) -> bytes:
+        return _SPHERE_COLLIDER.pack(self.unknown, *self.centre, self.radius)
+
+
+def decode_sphere_collider(block: bytes) -> Optional[SphereCollider]:
+    if len(block) != _SPHERE_COLLIDER.size:
+        return None
+    unknown, x, y, z, radius = _SPHERE_COLLIDER.unpack(block)
+    if not all(np.isfinite((x, y, z, radius))):
+        return None
+    return SphereCollider(centre=(x, y, z), radius=radius, unknown=unknown)
 
 
 def _parse_material(buf: bytes, offset: int, material_id: int,
