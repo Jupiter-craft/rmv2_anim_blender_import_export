@@ -323,8 +323,11 @@ untouched cloth writes the file's numbers.
 
 **A weighted cloth (58) is what the game draws**, and it is skinned —
 but not to the model's skeleton. The block is a skeleton of its own, one
-bone per particle of the cloth that drives it; the *k*-th weighted
-cloth in a LOD goes with the *k*-th cloth:
+bone per particle of the cloth that drives it. Nothing in the file
+names that cloth, and file order doesn't pair them: it does in the
+corbita, but not in the dromon or mk_swd's square sail. What picks the
+cloth out is geometry — in every sample exactly one cloth has a particle
+under each bone:
 
 | Field | Type | |
 | --- | --- | --- |
@@ -334,7 +337,7 @@ cloth in a LOD goes with the *k*-th cloth:
 | &nbsp;&nbsp;name | 32 bytes, UTF-16 | `bone_misc_05_01` |
 | &nbsp;&nbsp;unknown | f32 × 3 | 100, 200, 400 everywhere |
 | &nbsp;&nbsp;unknown | u32 × 5 | 12, 64, a per-mesh value, then 24 or 25 twice |
-| &nbsp;&nbsp;unknown | f32 | 1.0 or 0.0 |
+| &nbsp;&nbsp;flag | f32 | 0.0 or 1.0; 0.0 exactly where the particle's colour alpha is 0 |
 | &nbsp;&nbsp;inverse bind matrix | f32 × 12 | 3×4 row major, game → bone |
 | &nbsp;&nbsp;parent | i32 | −1: the skeleton is flat |
 | &nbsp;&nbsp;particle | u32 | the cloth particle the bone rides on |
@@ -361,18 +364,26 @@ chain of nodes, and the chain is all the file holds:
 | Field | Type | |
 | --- | --- | --- |
 | node count *n* | u32 | |
-| start attachment | i32 vertex, i32 cloth | −1, −1 when free |
-| end attachment | i32 vertex, i32 cloth | |
+| start attachment | i32 vertex, i32 mesh | −1, −1 when free |
+| end attachment | i32 vertex, i32 mesh | |
 | radius | f32 | 0.03124 in every rope seen |
 | unknown | u32 | 0, 8, 16 or 32, never above *n* − 1 |
 | nodes × *n* | f32 x, y, z, inverse mass, u | inverse mass 0 pins the node |
 | links × *n* − 1 | u32 i, u32 j, f32 rest length | |
 
-The cloth an attachment names counts the file's cloth meshes (id 60)
-in order, and the vertex is one of that mesh's: across all 28 ropes of
-a corbita's sails, every attached end sits on the named vertex to half
-precision. u is the texture coordinate along the rope, and each rest
-length is its link's authored length. The rope's bounding box is the
+The mesh an attachment names counts all of the LOD's meshes, and is
+always a cloth (id 60); the vertex is one of that cloth's particles.
+Counting only the cloths happens to give the same answer on the
+corbita, whose cloths come first, and fails on the dromon (cloth 85 of
+30). Across three ships, 65 of 67 attached ends sit on the named
+particle to half precision; the other two, both on mk_swd's square
+sail, are a tenth of a unit off, so the end need not sit exactly on its
+particle. A particle's colour alpha is 0 exactly where its bone's
+flag is 0, in every cloth of all three ships; what either means is not
+known.
+
+u is the texture coordinate along the rope, and each rest length is
+its link's authored length. The rope's bounding box is the
 swept tube's, within the radius of the nodes but not derivable from
 them exactly. In Blender a rope is its chain — vertices and edges, with
 inverse mass and u as point attributes — and export writes the chain
@@ -390,6 +401,18 @@ there is nothing to check a layout against.
 Positions are half4 with the W component as a scale factor, except where
 noted. Normals, tangents and binormals are u8x4 in the packed layouts and
 half4 in the wide ones.
+
+Reading W as a scale is safe in every layout but one, because CA's files
+before v8 only ever hold 1 there (0 on skinned vertices, read as 1). The
+exception is a terrain tile's base mesh (107), whose W is a value of its
+own between 0 and 1: XYZ alone puts every corner on the tile's grid, so
+W is kept as a channel and never applied. Writing a W other than CA's is
+not safe: the scale trick that squeezes extra precision out of a half
+— a W between 1 and 2 picked per vertex — shows up in CA's own files only
+in v8, Warhammer 3's static meshes. An Attila sail exported with it was
+scrambled in game, and W was the only thing left that set that sail apart
+from the ones that looked fine. Export uses the trick for v8 only, and
+otherwise writes W as CA does.
 
 | Format | Stride | Layout |
 | --- | --- | --- |

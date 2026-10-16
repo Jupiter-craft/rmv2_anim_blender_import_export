@@ -277,18 +277,27 @@ def _cloth_skeleton(model):
 
 def _bind_cloths(cloths, weighted) -> None:
     """Parent each cloth to the skeleton of the weighted cloth it drives,
-    so moving the armature moves the simulation with what it draws.  The
-    k-th of each go together; the bones are checked against the
-    particles, and a pair that does not line up is left alone."""
-    for (cloth_model, cloth_obj), (skel, arm_obj) in zip(cloths, weighted):
+    so moving the armature moves the simulation with what it draws.
+
+    Nothing in the file names the pair, and file order is no guide: the
+    corbita lists sails and cloths in the same order, but mk_swd's
+    square sail and the dromon do not.  A skeleton's bones sit on its
+    cloth's particles, though, which picks out exactly one cloth in
+    every sample - so that is what pairs them."""
+    graphs = [rf.decode_cloth(getattr(model.material, "trailing", b""))
+              for model, _ in cloths]
+    taken = set()
+    for skel, arm_obj in weighted:
         if arm_obj is None:
             continue
-        graph = rf.decode_cloth(getattr(cloth_model.material, "trailing",
-                                        b""))
-        if graph is None or not rmv2_cloth.drives(
-                skel, graph, cloth_model.mesh.positions):
-            continue
-        rmv2_cloth.parent_keep_transform(cloth_obj, arm_obj)
+        for k, ((cloth_model, cloth_obj), graph) in enumerate(
+                zip(cloths, graphs)):
+            if k in taken or graph is None:
+                continue
+            if rmv2_cloth.drives(skel, graph, cloth_model.mesh.positions):
+                rmv2_cloth.parent_keep_transform(cloth_obj, arm_obj)
+                taken.add(k)
+                break
 
 
 def _attach_matrix_to_blender(matrix12, scale: float) -> Matrix:
@@ -404,6 +413,7 @@ def import_file(context, filepath: str, options: dict):
         cloths = []
         weighted = []
         ropes = []
+        lod_objs = []
         for mesh_index, model in enumerate(lod.models):
             name = model.material.model_name or f"{stem}_mesh{mesh_index}"
             if len(lods) > 1:
@@ -418,6 +428,7 @@ def import_file(context, filepath: str, options: dict):
                     model, rmv.version, name, scale,
                     skeleton.bone_name_by_index(arm_obj), options)
                 col.objects.link(obj)
+                lod_objs.append(obj)
                 skeleton.attach_mesh(obj, arm_obj)
                 weighted.append((cloth_skeleton, arm_obj))
                 stats["meshes"] += 1
@@ -427,6 +438,7 @@ def import_file(context, filepath: str, options: dict):
             obj = _build_mesh_object(model, rmv.version, name, scale,
                                      bone_names, options)
             col.objects.link(obj)
+            lod_objs.append(obj)
             if model.material.material_id == rf.MAT_CLOTH:
                 cloths.append((model, obj))
             rope = _rope_graph(model)
@@ -444,11 +456,11 @@ def import_file(context, filepath: str, options: dict):
             stats["triangles"] += len(model.mesh.indices) // 3
         _bind_cloths(cloths, weighted)
         # A rope hangs from a cloth's particle, so it follows the cloth -
-        # and with it the sail's skeleton.
-        cloth_objs = [obj for _, obj in cloths]
+        # and with it the sail's skeleton.  The rope names its cloth by
+        # the cloth's place among all of the LOD's meshes.
         context.view_layer.update()
         for rope, obj in ropes:
-            rmv2_rope.hook_to_cloths(obj, rope, cloth_objs)
+            rmv2_rope.hook_to_cloths(obj, rope, lod.models, lod_objs)
 
     scene_layout.show_only_most_detailed_lod(context, lod_collections)
 

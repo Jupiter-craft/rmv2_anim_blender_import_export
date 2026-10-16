@@ -4166,6 +4166,159 @@ def _skin_local(positions, skel):
             + inv_bind[:, None, :, 3])
 
 
+def _rope_errors(models, source):
+    """How far the exported ropes are from hanging where they should.
+
+    A rope hangs from a particle, not a bone: the end the file attaches
+    has to stay with it, or the game's rope - still the old length -
+    drags the sail back where it was.  The attachment names its cloth by
+    place among all of the LOD's meshes.  Each end may sit as far from
+    its particle as CA left it (a tenth of a unit, on some), and the
+    far, pinned end stays put.
+
+    Returns (attached ends, worst gap beyond CA's, worst rest-length
+    error, worst pinned-end movement)."""
+    # Lists in file order: mk_swd has meshes that share a name, so a dict
+    # by name would lose some and miscount every place after them.
+    order = list(models.values()) if isinstance(models, dict) else models
+    before = list(source.values()) if isinstance(source, dict) else source
+    ropes_before = {m.material.model_name: m for m in before
+                    if m.material.material_id == rf.MAT_ROPE}
+    gap = rest = pin = 0.0
+    hung = 0
+    for model in order:
+        if model.material.material_id != rf.MAT_ROPE:
+            continue
+        rope = rf.decode_rope(model.material.trailing)
+        old = rf.decode_rope(
+            ropes_before[model.material.model_name].material.trailing)
+        pos = rope.nodes["position"].astype(np.float64)
+        rest = max(rest, np.abs(np.linalg.norm(
+            np.diff(pos, axis=0), axis=1) - rope.links["rest"]).max())
+        ends = [(rope.start_attachment, old.start_attachment, 0),
+                (rope.end_attachment, old.end_attachment, -1)]
+        for (vertex, mesh), (old_vertex, old_mesh), node in ends:
+            if mesh < 0:
+                if (old.nodes["inv_mass"][node] == 0.0
+                        and any(m >= 0 for (_, m), _, _ in ends)):
+                    pin = max(pin, np.abs(
+                        pos[node] - old.nodes["position"][node]).max())
+                continue
+            hung += 1
+            target = order[mesh]
+            if target.material.material_id != rf.MAT_CLOTH:
+                gap = float("inf")
+                continue
+            slack = np.linalg.norm(
+                old.nodes["position"][node]
+                - before[old_mesh].mesh.positions[old_vertex])
+            gap = max(gap, np.linalg.norm(
+                pos[node] - target.mesh.positions[vertex]) - slack)
+    return hung, gap, rest, pin
+
+
+def rigging_case(tmpdir):
+    """Two more ships' rigging, which the corbita could not catch.
+
+    The corbita lists its sails in the same order as the cloths that
+    drive them, and lists its cloths first - so pairing the k-th of each,
+    and counting only cloths for a rope's attachment, both happened to
+    work on it.  On mk_swd's square sail and the dromon neither holds:
+    half or more of the sims were left off their skeletons, and ropes
+    were hooked to the wrong cloth or none.
+    """
+    print("\n=== rigging: sails and ropes on other ships ===")
+    from mathutils import Matrix
+    from io_scene_rmv2 import cloth as rmv2_cloth
+    import math
+
+    options = {"source": "AUTO", "version": "6", "skeleton_name": "",
+               "apply_modifiers": True, "high_precision": True,
+               "write_attach_points": True, "global_scale": 1.0}
+    for stem in ("mk_swd_sail_square_bese_1", "sails_dromon_flat_colour"):
+        sample = os.path.join(SAMPLES, "attila", stem + ".rigid_model_v2")
+        if not os.path.isfile(sample):
+            print(f"  ({stem} skipped - sample not present)")
+            continue
+        reset_scene()
+        source = rf.load(open(sample, "rb").read()).lods[0].models
+        root, _ = import_rmv2.import_file(bpy.context, sample, {
+            "import_lods": "ALL", "build_materials": False,
+            "texture_root": "", "create_attach_empties": False,
+            "global_scale": 1.0,
+        })
+
+        def export(name):
+            activate_collection(root.name)
+            dst = os.path.join(tmpdir, name)
+            _, warnings = export_rmv2.export_file(bpy.context, dst, options)
+            return rf.load(open(dst, "rb").read()).lods[0].models, warnings
+
+        sims = [o for o in bpy.data.objects
+                if o.type == "MESH" and o.rmv2.material_id == "cloth"]
+        check(sims and all(rmv2_cloth.is_cloth_skeleton(o.parent)
+                           for o in sims),
+              f"{stem}: every cloth rides the skeleton of the sail it drives")
+        for sim in sims:
+            sail = sim.parent.name[:-len("_skeleton")]
+            if sim.name != sail.replace("display_", "sim_") + "_LOD1":
+                check(False, f"{stem}: {sim.name} rides {sim.parent.name}")
+                break
+        hooked = sum(1 for o in bpy.data.objects for m in o.modifiers
+                     if m.type == "HOOK")
+        attached = sum(
+            (r.start_attachment[1] >= 0) + (r.end_attachment[1] >= 0)
+            for r in (rf.decode_rope(m.material.trailing)
+                      for m in source
+                      if m.material.material_id == rf.MAT_ROPE))
+        check(hooked == attached,
+              f"{stem}: every attached rope end is hooked to its cloth "
+              f"({hooked} of {attached})")
+
+        plain, warnings = export(stem + "_plain.rigid_model_v2")
+        check(len(plain) == len(source)
+              and all(a.material.trailing == b.material.trailing
+                      for a, b in zip(source, plain)),
+              f"{stem}: an untouched export writes every physics block "
+              "back exactly")
+        check(not warnings,
+              f"{stem}: no warnings on an untouched export ({warnings[:2]})")
+
+        move = (Matrix.Translation((1.0, 2.0, 0.5))
+                @ Matrix.Rotation(math.radians(30), 4, "Z"))
+        for arm in [o for o in bpy.data.objects
+                    if rmv2_cloth.is_cloth_skeleton(o)]:
+            arm.matrix_world = move @ arm.matrix_world
+        bpy.context.view_layer.update()
+        moved, warnings = export(stem + "_moved.rigid_model_v2")
+        hung, gap, rest, pin = _rope_errors(moved, source)
+        check(hung == attached and gap < 0.02,
+              f"{stem}: moved, every attached rope end stays with its "
+              f"particle ({hung} ends, {gap:.4f})")
+        check(rest < 1e-4 and pin < 1e-5,
+              f"{stem}: moved, rest lengths follow and pinned ends stay "
+              f"({rest:.6f}, {pin:.6f})")
+        check(not warnings, f"{stem}: no warnings moving the skeletons "
+              f"({warnings[:2]})")
+
+        # Deleting a mesh ahead of a cloth moves that cloth up one; the
+        # ropes have to follow it, not keep naming the old place.
+        ids = [m.material.material_id for m in source]
+        first = next(k for k, mid in enumerate(ids)
+                     if mid not in (rf.MAT_CLOTH, rf.MAT_WEIGHTED_CLOTH)
+                     and rf.MAT_CLOTH in ids[k:])
+        victim = source[first].material.model_name
+        check(sum(m.material.model_name == victim for m in source) == 1,
+              f"{stem}: {victim} is the only mesh of that name")
+        bpy.data.objects.remove(bpy.data.objects[victim])
+        bpy.context.view_layer.update()
+        fewer, warnings = export(stem + "_fewer.rigid_model_v2")
+        hung, gap, _, _ = _rope_errors(fewer, source)
+        check(len(fewer) == len(source) - 1 and gap < 0.02 and not warnings,
+              f"{stem}: with a mesh deleted, ropes still name their cloth "
+              f"({gap:.4f}, {warnings[:2]})")
+
+
 def cloth_case(tmpdir):
     """A sail moved in Blender has to move in the game too.
 
@@ -4263,38 +4416,21 @@ def cloth_case(tmpdir):
     check(all(m.material.pivot == (0.0, 0.0, 0.0) for m in moved.values()),
           "moved: the translation is in the positions, never the pivot")
     check(not warnings, f"no warnings moving the skeletons ({warnings})")
+    # A moved sail's positions no longer fit a half exactly, which is
+    # what used to bring out the W-scale trick - and Attila scrambled
+    # the sail.  W stays what CA writes: 0 on a sail, 1 on a cloth.
+    w_seen = {rf.MAT_WEIGHTED_CLOTH: set(), rf.MAT_CLOTH: set()}
+    for model in moved.values():
+        mid = model.material.material_id
+        if mid in w_seen:
+            dt = rf._vertex_dtype(model.mesh.raw_format, 6)
+            raw = np.frombuffer(model.mesh.raw_block, dt,
+                                model.mesh.vertex_count)
+            w_seen[mid] |= set(raw["pos"][:, 3].astype(float).tolist())
+    check(w_seen == {rf.MAT_WEIGHTED_CLOTH: {0.0}, rf.MAT_CLOTH: {1.0}},
+          f"moved: W is CA's, 0 on sails and 1 on cloths ({w_seen})")
 
-    # A rope hangs from a particle, not a bone: the end the file
-    # attaches has to stay on it, or the game's rope - still the old
-    # length - drags the sail back where it was.  The far, pinned end
-    # stays put.
-    def rope_errors(models):
-        cloths = [m for m in models.values()
-                  if m.material.material_id == rf.MAT_CLOTH]
-        gap = rest = pin = 0.0
-        hung = 0
-        for name, model in models.items():
-            if model.material.material_id != rf.MAT_ROPE:
-                continue
-            rope = rf.decode_rope(model.material.trailing)
-            old = rf.decode_rope(source[name].material.trailing)
-            pos = rope.nodes["position"].astype(np.float64)
-            rest = max(rest, np.abs(np.linalg.norm(
-                np.diff(pos, axis=0), axis=1) - rope.links["rest"]).max())
-            ends = [(rope.start_attachment, 0), (rope.end_attachment, -1)]
-            for (vertex, cloth), node in ends:
-                if cloth < 0:
-                    if (old.nodes["inv_mass"][node] == 0.0
-                            and any(c >= 0 for (_, c), _ in ends)):
-                        pin = max(pin, np.abs(
-                            pos[node] - old.nodes["position"][node]).max())
-                    continue
-                hung += 1
-                gap = max(gap, np.linalg.norm(
-                    pos[node] - cloths[cloth].mesh.positions[vertex]))
-        return hung, gap, rest, pin
-
-    hung, gap, rest, pin = rope_errors(moved)
+    hung, gap, rest, pin = _rope_errors(moved, source)
     check(hung == 25 and gap < 0.02,
           f"moved: every attached rope end is on its particle "
           f"({hung} ends, {gap:.4f})")
@@ -4311,7 +4447,7 @@ def cloth_case(tmpdir):
             rope_obj.modifiers.remove(mod)
     bpy.context.view_layer.update()
     unhooked, warnings = export("cloth_unhooked.rigid_model_v2")
-    hung, gap, rest, pin = rope_errors(unhooked)
+    hung, gap, rest, pin = _rope_errors(unhooked, source)
     check(gap < 0.02 and rest < 1e-4 and pin < 1e-5,
           f"unhooked: the rope is pulled onto its particle on export "
           f"({gap:.4f}, {rest:.6f}, {pin:.6f})")
@@ -4423,6 +4559,7 @@ def main():
         rope_case(tmpdir)
         vertex_order_and_frame_case(tmpdir)
         cloth_case(tmpdir)
+        rigging_case(tmpdir)
     except Exception:
         traceback.print_exc()
         FAILURES.append("unhandled exception (see traceback)")

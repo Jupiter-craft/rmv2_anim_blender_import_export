@@ -1439,6 +1439,7 @@ def _export_lods(context, root, lods, filepath: str, options: dict):
         )
         ratio = info.get("decimate_ratio", 1.0)
         fmt_override = info.get("vertex_format_override")
+        sources = []
         for obj in objs:
             cache_key = (obj.name, ratio, fmt_override)
             if cache_key in built_cache:
@@ -1458,10 +1459,12 @@ def _export_lods(context, root, lods, filepath: str, options: dict):
                 # model's, so it needs no skeleton name.
                 any_skinned = True
             lod.models.append(model)
+            sources.append(obj)
         if not lod.models:
             raise ExportError(
                 f"LOD {info['level']}: no exportable meshes")
-        rmv2_rope.follow_cloths(lod.models, warnings)
+        rmv2_rope.follow_cloths(lod.models, sources, warnings,
+                                options.get("apply_modifiers", True))
         rmv.lods.append(lod)
 
     if any_skinned and not skeleton:

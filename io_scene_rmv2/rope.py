@@ -10,16 +10,21 @@ export switches it off before reading the chain, so the preview is never
 written as geometry.
 
 A rope does not hang from a bone.  Each end the file attaches names a
-particle - a vertex of one of the LOD's cloths (60) - and the game holds
-that end of the rope on it.  So in Blender an attached end is hooked to
-the cloth object, easing off along the chain to nothing at the far end:
-move a sail's skeleton and the cloth goes with it, dragging the rope.
-Export reads the hooked chain, and then puts any attached end that is
-still not on its particle there (a scene imported before the hooks, or
-a hook removed), easing the rest of the rope after it the same way.
+particle - vertex v of mesh m, where m counts all of the LOD's meshes
+and lands on a cloth (60) - and the game holds that end of the rope on
+it, give or take: CA leaves a few ends a tenth of a unit off.  So in
+Blender an attached end is hooked to the cloth object, easing off along
+the chain to nothing at the far end: move a sail's skeleton and the
+cloth goes with it, dragging the rope.  Export reads the hooked chain,
+renumbers each hooked end by where its cloth landed in the file, and
+then puts any attached end that has come away from its particle back
+where it was (a scene imported before the hooks, or a hook removed),
+easing the rest of the rope after it the same way.
 """
 
 from __future__ import annotations
+
+import json
 
 import bpy
 import numpy as np
@@ -32,6 +37,7 @@ U_ATTRIBUTE = "rmv2_rope_u"
 PREVIEW_GROUP = "RMV2 Rope Preview"
 PREVIEW_MODIFIER = "Rope Preview"
 HOOK_GROUPS = ("rmv2_rope_start", "rmv2_rope_end")
+OFFSETS_KEY = "rope_attach_offsets"
 
 
 def build_mesh(name: str, rope: rf.RopeGraph, scale: float):
@@ -196,17 +202,36 @@ def _attached_ends(rope: rf.RopeGraph):
             yield int(vertex), int(cloth), from_start
 
 
-def hook_to_cloths(obj, rope: rf.RopeGraph, cloth_objs: list) -> None:
+def _offsets(obj) -> dict:
+    try:
+        extra = json.loads(obj.rmv2.extra_json) if obj.rmv2.extra_json else {}
+    except ValueError:
+        extra = {}
+    return extra.get(OFFSETS_KEY, {})
+
+
+def hook_to_cloths(obj, rope: rf.RopeGraph, models: list,
+                   objs: list) -> None:
     """Hook each attached end of the rope to the cloth it hangs from.
-    `cloth_objs` are the LOD's cloths in file order, which is what the
-    attachment's cloth number counts.  Nothing moves now: the hook takes
-    the cloth's transform from here on."""
+    `models` and `objs` are the LOD's meshes in file order, the order a
+    rope's cloth number counts.  Nothing moves now: the hook takes the
+    cloth's transform from here on.  How far each end sits from its
+    particle is kept too - CA leaves some a tenth of a unit off - so that
+    export can hold it there rather than snap it on."""
     positions = rope.nodes["position"].astype(np.float64)
     hooks = []
+    offsets = {}
     for vertex, cloth, from_start in _attached_ends(rope):
-        if cloth >= len(cloth_objs):
+        if (cloth >= len(models) or cloth >= len(objs)
+                or getattr(models[cloth].material, "material_id",
+                           None) != rf.MAT_CLOTH
+                or vertex >= models[cloth].mesh.vertex_count):
             continue
-        target = cloth_objs[cloth]
+        end = "start" if from_start else "end"
+        particle = models[cloth].mesh.positions[vertex].astype(np.float64)
+        offsets[end] = (positions[0 if from_start else -1]
+                        - particle).tolist()
+        target = objs[cloth]
         group = obj.vertex_groups.new(
             name=HOOK_GROUPS[0 if from_start else 1])
         for k, weight in enumerate(falloff(positions, from_start)):
@@ -223,32 +248,74 @@ def hook_to_cloths(obj, rope: rf.RopeGraph, cloth_objs: list) -> None:
     # The hooks bend the chain and the preview sweeps the bent one.
     for k, name in enumerate(hooks):
         obj.modifiers.move(obj.modifiers.find(name), k)
+    if offsets:
+        extra = json.loads(obj.rmv2.extra_json) if obj.rmv2.extra_json \
+            else {}
+        extra[OFFSETS_KEY] = offsets
+        obj.rmv2.extra_json = json.dumps(extra)
 
 
-def follow_cloths(models: list, warnings: list) -> None:
-    """Put every attached rope end in a LOD's models on its particle, as
-    written: an end left behind by a moved sail is tied to a particle
-    somewhere else, and the game's rope - its links still the old
-    lengths - hauls the sail back toward it."""
-    cloths = [m for m in models
-              if getattr(m.material, "material_id", None) == rf.MAT_CLOTH]
-    for model in models:
+def _hooked_cloth(obj, from_start: bool):
+    """The object the hook on this end of the rope hangs it from."""
+    group = HOOK_GROUPS[0 if from_start else 1]
+    for mod in obj.modifiers:
+        if (mod.type == "HOOK" and mod.vertex_group == group
+                and mod.object is not None):
+            return mod.object
+    return None
+
+
+def follow_cloths(models: list, sources: list, warnings: list,
+                  hooks_applied: bool = True) -> None:
+    """Bring every rope in a LOD's models up to date with its cloths.
+    `sources` are the Blender objects the models were built from, and
+    `hooks_applied` says whether the chains were read with their hooks.
+
+    A hooked end names its cloth by where that cloth landed in this
+    export, so meshes deleted or reordered in Blender do not leave it
+    naming some other mesh.  Then each attached end with no hook to carry
+    it is put back where it sat relative to its particle on import: an
+    end left behind by a moved sail is tied to a particle somewhere else,
+    and the game's rope - its links still the old lengths - hauls the
+    sail back.  A hooked end is already there, its offset turned with
+    the cloth, which the import-time offset alone cannot do."""
+    for model, obj in zip(models, sources):
         material = model.material
         if getattr(material, "material_id", None) != rf.MAT_ROPE:
             continue
         rope = rf.decode_rope(getattr(material, "trailing", b""))
         if rope is None:
             continue
+        original = rope.write()
+        offsets = _offsets(obj) if obj is not None else {}
         positions = rope.nodes["position"].astype(np.float64)
         pulled = False
-        for vertex, cloth, from_start in _attached_ends(rope):
-            if (cloth >= len(cloths)
-                    or vertex >= cloths[cloth].mesh.vertex_count):
+        for vertex, cloth, from_start in list(_attached_ends(rope)):
+            end = "start" if from_start else "end"
+            hooked = (_hooked_cloth(obj, from_start) if obj is not None
+                      else None)
+            if hooked is not None and hooked in sources:
+                cloth = sources.index(hooked)
+                if from_start:
+                    rope.start_attachment = (vertex, cloth)
+                else:
+                    rope.end_attachment = (vertex, cloth)
+            carried = hooked is not None and hooks_applied
+            target_model = models[cloth] if cloth < len(models) else None
+            if (target_model is None
+                    or getattr(target_model.material, "material_id",
+                               None) != rf.MAT_CLOTH
+                    or vertex >= target_model.mesh.vertex_count):
                 warnings.append(
-                    f"{material.model_name}: hangs from particle {vertex} "
-                    f"of cloth {cloth}, which this LOD does not have")
+                    f"{material.model_name}: its {end} hangs from "
+                    f"particle {vertex} of mesh {cloth}, which is not a "
+                    "cloth in this LOD with that many particles")
                 continue
-            target = cloths[cloth].mesh.positions[vertex].astype(np.float64)
+            if carried:
+                continue
+            target = (target_model.mesh.positions[vertex].astype(np.float64)
+                      + np.asarray(offsets.get(end, (0.0, 0.0, 0.0)),
+                                   np.float64))
             gap = target - positions[0 if from_start else -1]
             # The particle is written at half precision; the rope is not.
             tolerance = max(0.02, float(np.abs(target).max()) * 2.0 ** -9)
@@ -258,21 +325,22 @@ def follow_cloths(models: list, warnings: list) -> None:
             positions += falloff(positions, from_start)[:, None] * gap
             pulled = True
             warnings.append(
-                f"{material.model_name}: its "
-                f"{'start' if from_start else 'end'} hangs from particle "
-                f"{vertex} of {cloths[cloth].material.model_name}, which "
-                f"is {distance:.3g} away from it, so the rope was pulled "
-                "after it. Import the file again to see ropes follow "
-                "their sails in Blender")
-        if not pulled:
-            continue
-        rope.nodes["position"] = positions
-        written = rope.nodes["position"].astype(np.float64)
-        rope.links["rest"] = np.linalg.norm(
-            written[rope.links["j"]] - written[rope.links["i"]], axis=1)
-        material.trailing = rope.write()
-        model.bbox_min = tuple((written.min(axis=0) - rope.radius).tolist())
-        model.bbox_max = tuple((written.max(axis=0) + rope.radius).tolist())
+                f"{material.model_name}: its {end} hangs from particle "
+                f"{vertex} of {target_model.material.model_name}, which "
+                f"is {distance:.3g} away from where it was, so the rope "
+                "was pulled after it. Import the file again to see ropes "
+                "follow their sails in Blender")
+        if pulled:
+            rope.nodes["position"] = positions
+            written = rope.nodes["position"].astype(np.float64)
+            rope.links["rest"] = np.linalg.norm(
+                written[rope.links["j"]] - written[rope.links["i"]], axis=1)
+            model.bbox_min = tuple(
+                (written.min(axis=0) - rope.radius).tolist())
+            model.bbox_max = tuple(
+                (written.max(axis=0) + rope.radius).tolist())
+        if rope.write() != original:
+            material.trailing = rope.write()
 
 
 def read_graph(obj, scale: float, original, warnings: list, me=None):

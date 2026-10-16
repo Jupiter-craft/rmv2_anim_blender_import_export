@@ -93,7 +93,10 @@ VF_GRASS = 106            # stride 28
 
 # A terrain tile's base mesh: a half4 position and nothing else.  The
 # material names it TerrainBase0 and the height comes from the tile's
-# own textures, so there is nothing else to store.
+# own textures.  W is not a scale here: XYZ alone lands every vertex of
+# Attila's farmland tile on the tile's grid (0, 32, 64 ... 256), and W
+# runs from 0 to 1 - a per-vertex value of unknown meaning, kept as the
+# "w" channel.  Read as a scale it pulled 33 of 117 corners off the grid.
 VF_POSITION_HALF = 107    # stride 8
 
 # Warhammer's wind-swayed props - hanging cloth, bone cages, leaf cards,
@@ -707,7 +710,8 @@ def decode_vertices(buf: bytes, offset: int, count: int, stride: int,
         if vertex_format == VF_COLLISION:
             mesh.normals = raw["normal"].astype(np.float32)
     elif vertex_format == VF_POSITION_HALF:
-        mesh.positions = _decode_position_half4(raw["pos"])
+        mesh.positions = raw["pos"][:, :3].astype(np.float32)
+        mesh.extras["w"] = raw["pos"][:, 3:4].astype(np.float32)
     elif vertex_format == VF_TREE_BILLBOARD:
         mesh.positions = _decode_position_half4(raw["pos"])
         mesh.normals = raw["normal"][:, :3].astype(np.float32)
@@ -794,6 +798,7 @@ EXTRA_CHANNELS = {
     VF_VEGETATION: {"pivot": 4, "wind": 8},
     VF_TREE_BILLBOARD: {"unknown": 4},
     VF_S2_BOW_WAVE: {"pos2": 4, "unknown": 1},
+    VF_POSITION_HALF: {"w": 1},
     VF_CUSTOM_TERRAIN2: {"col1": 4, "col2": 4},
 }
 
@@ -838,9 +843,11 @@ def _encode_vertices_vegetation(mesh: RmvMeshData, raw: np.ndarray,
     weights - had somewhere to live; see RmvMeshData.extras.
     """
     n = mesh.vertex_count
-    raw["pos"] = encode_position_half4(mesh.positions, high_precision)
     if vertex_format == VF_POSITION_HALF:
+        raw["pos"][:, :3] = np.asarray(mesh.positions, np.float32)
+        raw["pos"][:, 3] = _extra(mesh, "w", 1)[:, 0]
         return raw.tobytes()
+    raw["pos"] = encode_position_half4(mesh.positions, high_precision)
 
     raw["uv"] = mesh.uv0.astype(
         np.float32 if vertex_format == VF_GRASS else np.float16)
@@ -876,6 +883,15 @@ def encode_vertices(mesh: RmvMeshData, vertex_format: int, version: int,
         # vertices at all - including formats that have no layout here.
         return b""
     dt = _vertex_dtype(vertex_format, version)
+    # The W-scale trick is Warhammer 3's: CA's own files use it only in
+    # v8, and before that write W as 1 (0 on skinned vertices) in every
+    # sample of every game.  A corbita sail moved in Blender came out with
+    # W anywhere from 1 to 2 and was scrambled in Attila, and W was the
+    # one thing left that set it apart from the sails that were fine -
+    # which fits a game reading XYZ and ignoring W, each vertex then off
+    # by up to half its distance from the origin.  So older files store
+    # XYZ as they are.
+    high_precision = high_precision and version == 8
 
     if (mesh.raw_block is not None
             and mesh.raw_format == vertex_format
@@ -939,6 +955,8 @@ def encode_vertices(mesh: RmvMeshData, vertex_format: int, version: int,
             "is not supported (read-only format)")
 
     raw["pos"] = encode_position_half4(mesh.positions, high_precision)
+    if vertex_format != VF_STATIC and version < 8:
+        raw["pos"][:, 3] = 0.0     # as CA writes every skinned vertex
 
     normals, tangents, binormals = \
         mesh.normals, mesh.tangents, mesh.binormals
@@ -1645,15 +1663,16 @@ _NAMED_MATERIAL_IDS = (29, 30)
 #
 #     u32       node count n
 #     i32 x 2   start attachment: vertex, cloth    (-1, -1 when there is none)
-#     i32 x 2   end attachment: vertex, cloth
+#     i32 x 2   end attachment: vertex, mesh
 #     f32       tube radius
 #     u32       unknown: 0, 8, 16 or 32, never above n - 1
 #     n x       f32 x, y, z, inverse mass, u       (inverse mass 0 = pinned)
 #     n-1 x     u32 i, u32 j, f32 rest length
 #
-# An attachment's cloth counts the file's cloth meshes (id 60) in order,
-# and its vertex is one of that mesh's; the attached end node sits on
-# that vertex to half precision.  The positions are in the same space as
+# An attachment's mesh counts all of the LOD's meshes, and lands on a
+# cloth (60); its vertex is one of that cloth's, and the attached end
+# node sits on it - to half precision in 65 of 67 ends across three
+# ships, and a tenth of a unit off in the other two.  The positions are in the same space as
 # any mesh's vertices.  u is the texture coordinate along the rope, and
 # each rest length is its link's length as authored.  The triangulation
 # of the tube - 24 triangles a segment and a ten-triangle fan at each
@@ -1668,7 +1687,7 @@ _ROPE_LINK = np.dtype([("i", "<u4"), ("j", "<u4"), ("rest", "<f4")])
 class RopeGraph:
     nodes: np.ndarray                   # (n,) _ROPE_NODE, game space
     links: np.ndarray                   # (n-1,) _ROPE_LINK
-    start_attachment: tuple = (-1, -1)  # (vertex, cloth)
+    start_attachment: tuple = (-1, -1)  # (vertex, mesh in the LOD)
     end_attachment: tuple = (-1, -1)
     radius: float = 0.03125
     unknown: int = 0
@@ -1759,8 +1778,10 @@ def decode_cloth(block: bytes) -> Optional[ClothGraph]:
 
 # A weighted cloth (58) is what the game draws: an ordinary skinned mesh
 # whose skeleton is not the model's but its own, one bone per particle of
-# the cloth that drives it.  The k-th weighted cloth in a LOD goes with
-# the k-th cloth.  The block after the material is that skeleton:
+# the cloth that drives it.  Nothing names that cloth, and file order
+# does not pair them (it does in the corbita, not in the dromon or
+# mk_swd's square sail); the bones sitting on its particles is what
+# picks it out.  The block after the material is that skeleton:
 #
 #     u32       bone count n
 #     u32       unknown (0)
@@ -1768,7 +1789,8 @@ def decode_cloth(block: bytes) -> Optional[ClothGraph]:
 #         32    name, UTF-16, zero padded
 #         f32 x 3   unknown (100, 200, 400 in every one seen)
 #         u32 x 5   unknown (12, 64, a per-mesh value, 24 or 25 twice)
-#         f32       unknown (1.0 or 0.0)
+#         f32       0.0 exactly where the particle's colour alpha is
+#                   0, else 1.0; meaning unknown
 #         f32 x 12  inverse bind matrix, 3x4 row major: game -> bone
 #         i32       parent (-1: the skeleton is flat)
 #         u32       the cloth particle the bone rides on

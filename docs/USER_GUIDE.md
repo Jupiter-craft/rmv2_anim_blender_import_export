@@ -310,7 +310,7 @@ Multi-file selection works for RMV2, Shogun 2 RigidModel, Unit Part, Unit Mesh a
 | Skeleton | RMV2, Unit Part, .anim | Header skeleton name; defaults to what was stored at import |
 | Generate LODs (Decimate) | RMV2, Unit Part | Build the lower LODs from the finest by decimation instead of using LOD collections. Not for `.variant_part_mesh` library files, whose parts are named individually |
 | Apply Modifiers | all meshes | Export the evaluated mesh. Armature deform is *always* excluded, so the rest pose is written |
-| High Precision Positions | RMV2 | CA's half-float `W`-scale trick for extra precision (slower) |
+| High Precision Positions | RMV2 | CA's half-float `W`-scale trick for extra precision (slower). Warhammer 3-era (v8) files only; older versions store positions directly, as CA does |
 | Attachment Points | RMV2 | Write them, from the collection's list or the armature's bones |
 | Mode | .anim | *Animation* samples the scene frame range; *Bind Pose (Skeleton)* writes the rest pose |
 | Frame Rate | .anim | 0 = use the armature's stored rate, else the scene's |

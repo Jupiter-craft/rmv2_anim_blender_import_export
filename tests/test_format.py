@@ -140,6 +140,56 @@ class TestPositionEncoding(unittest.TestCase):
             enc = rf.encode_position_half4(pos, high_precision=hp)
             self.assertTrue(np.all(enc[:, 3].astype(np.float32) != 0.0))
 
+    def test_w_trick_is_v8_only(self):
+        """Before v8, W is what CA writes - 1, or 0 on a skinned vertex -
+        whatever the precision option says: an Attila sail written with
+        the trick was scrambled in game.  v8 keeps the trick."""
+        cases = ((rf.VF_STATIC, 0, 1.0), (rf.VF_WEIGHTED, 2, 0.0),
+                 (rf.VF_CINEMATIC, 4, 0.0))
+        for version in (5, 6, 7, 8):
+            for vertex_format, weights, expected in cases:
+                with self.subTest(version=version, format=vertex_format):
+                    mesh = make_cube_mesh(weight_count=weights)
+                    dt = rf._vertex_dtype(vertex_format, version)
+                    raw = np.frombuffer(rf.encode_vertices(
+                        mesh, vertex_format, version, high_precision=True),
+                        dt, mesh.vertex_count)
+                    w = raw["pos"][:, 3].astype(np.float32)
+                    if version == 8:
+                        self.assertTrue((w != 1.0).any())
+                    else:
+                        np.testing.assert_array_equal(w, expected)
+                    decoded = rf.decode_vertices(
+                        raw.tobytes(), 0, mesh.vertex_count, dt.itemsize,
+                        vertex_format, version)
+                    np.testing.assert_allclose(decoded.positions,
+                                               mesh.positions, atol=1e-3)
+
+    def test_terrain_base_w_is_not_a_scale(self):
+        """A terrain tile's base mesh (107) keeps a value of its own in W:
+        XYZ alone puts every corner on the tile's grid, and W - 0 to 1 -
+        comes back untouched as the "w" channel."""
+        path = os.path.join(os.path.dirname(SAIL_SAMPLE),
+                            "terrain_tile_farmland.rigid_model_v2")
+        if not os.path.isfile(path):
+            self.skipTest("sample not present")
+        with open(path, "rb") as handle:
+            rmv = rf.load(handle.read())
+        grid = [0, 16, 32, 64, 96, 128, 160, 192, 224, 256]
+        seen = 0
+        for model in rmv.lods[0].models:
+            mesh = model.mesh
+            if mesh.raw_format != rf.VF_POSITION_HALF:
+                continue
+            seen += 1
+            self.assertTrue(np.isin(mesh.positions[:, [0, 2]], grid).all(),
+                            model.material.model_name)
+            original = mesh.raw_block
+            mesh.raw_block = None
+            self.assertEqual(rf.encode_vertices(mesh, rf.VF_POSITION_HALF,
+                                                rmv.version), original)
+        self.assertGreater(seen, 0)
+
     def test_out_of_range_raises(self):
         pos = np.array([[1e6, 0, 0]], np.float32)
         with self.assertRaises(rf.RmvFormatError):
@@ -1133,6 +1183,14 @@ class TestRope(unittest.TestCase):
 SAIL_SAMPLE = os.path.join(os.path.dirname(__file__), "..", "samples",
                            "attila",
                            "sails_light_corbita_emblem_chi_rho.rigid_model_v2")
+# Three ships' rigging.  The corbita lists its sails and cloths in the
+# same order and its cloths first; the other two do neither, which is
+# what showed that neither order means anything.
+SAIL_SAMPLES = [os.path.join(os.path.dirname(SAIL_SAMPLE), name)
+                for name in ("sails_light_corbita_emblem_chi_rho"
+                             ".rigid_model_v2",
+                             "mk_swd_sail_square_bese_1.rigid_model_v2",
+                             "sails_dromon_flat_colour.rigid_model_v2")]
 
 
 class TestClothBlocks(unittest.TestCase):
@@ -1200,17 +1258,25 @@ class TestClothBlocks(unittest.TestCase):
         self.assertIsNone(rf.decode_sphere_collider(blob + b"\0"))
 
     def test_the_sails(self):
-        """Every block in a real file decodes and writes back exactly, and
-        the k-th weighted cloth is skinned to the k-th cloth: one bone per
-        particle, each bone sitting on its particle."""
-        if not os.path.isfile(SAIL_SAMPLE):
-            self.skipTest("sample not present")
-        with open(SAIL_SAMPLE, "rb") as handle:
-            models = rf.load(handle.read()).lods[0].models
+        """Every block in three ships' rigging decodes and writes back
+        exactly.  Each weighted cloth is skinned to exactly one cloth -
+        one bone per particle, each bone on its particle - found by
+        geometry, since file order does not pair them.  A rope names its
+        cloth by the cloth's place among all of the LOD's meshes."""
+        samples = [path for path in SAIL_SAMPLES if os.path.isfile(path)]
+        if not samples:
+            self.skipTest("samples not present")
         decoders = {rf.MAT_WEIGHTED_CLOTH: rf.decode_cloth_skeleton,
                     rf.MAT_CLOTH: rf.decode_cloth,
                     rf.MAT_COLLISION_SHAPE: rf.decode_sphere_collider,
                     rf.MAT_ROPE: rf.decode_rope}
+        for path in samples:
+            with self.subTest(os.path.basename(path)):
+                with open(path, "rb") as handle:
+                    models = rf.load(handle.read()).lods[0].models
+                self._check_rigging(models, decoders)
+
+    def _check_rigging(self, models, decoders):
         for model in models:
             block = model.material.trailing
             decoded = decoders[model.material.material_id](block)
@@ -1223,23 +1289,50 @@ class TestClothBlocks(unittest.TestCase):
         weighted = [m for m in models
                     if m.material.material_id == rf.MAT_WEIGHTED_CLOTH]
         self.assertEqual(len(cloths), len(weighted))
-        for cloth, display in zip(cloths, weighted):
-            graph = rf.decode_cloth(cloth.material.trailing)
+        for display in weighted:
             skel = rf.decode_cloth_skeleton(display.material.trailing)
-            p = graph.particle_count
-            self.assertEqual(sorted(skel.bones["particle"].tolist()),
-                             list(range(p)))
             frames = np.tile(np.eye(4), (len(skel.bones), 1, 1))
             frames[:, :3, :] = skel.bones["inv_bind"]
             origins = np.linalg.inv(frames)[:, :3, 3]
-            gaps = np.linalg.norm(
-                origins - cloth.mesh.positions[skel.bones["particle"]],
-                axis=1)
-            self.assertLess(gaps.max(), 0.01, display.material.model_name)
+            particles = skel.bones["particle"].astype(np.int64)
+            driven = []
+            for cloth in cloths:
+                graph = rf.decode_cloth(cloth.material.trailing)
+                p = graph.particle_count
+                if sorted(particles.tolist()) != list(range(p)):
+                    continue
+                gaps = np.linalg.norm(
+                    origins - cloth.mesh.positions[particles], axis=1)
+                if gaps.max() < 0.02:
+                    driven.append((cloth, p))
+            self.assertEqual(len(driven), 1, display.material.model_name)
+            cloth, p = driven[0]
             self.assertLess(int(display.mesh.bone_indices.max()), p)
             # double sided: vertex i + p is a copy of vertex i
             np.testing.assert_array_equal(cloth.mesh.positions[:p],
                                           cloth.mesh.positions[p:2 * p])
+            # A particle's colour alpha is 0 exactly where its bone's
+            # flag is - the pinned ones, along the yard.
+            np.testing.assert_array_equal(
+                cloth.mesh.colours[particles, 3] > 0.5,
+                skel.bones["unknown_flag"] == 1.0)
+
+        for model in models:
+            if model.material.material_id != rf.MAT_ROPE:
+                continue
+            rope = rf.decode_rope(model.material.trailing)
+            for (vertex, mesh), node in ((rope.start_attachment, 0),
+                                         (rope.end_attachment, -1)):
+                if mesh < 0:
+                    continue
+                target = models[mesh]
+                self.assertEqual(target.material.material_id, rf.MAT_CLOTH,
+                                 model.material.model_name)
+                # CA leaves a few ends a tenth of a unit off.
+                self.assertLess(np.linalg.norm(
+                    target.mesh.positions[vertex]
+                    - rope.nodes["position"][node]), 0.15,
+                    model.material.model_name)
 
 
 class TestAnimRoundtrip(unittest.TestCase):

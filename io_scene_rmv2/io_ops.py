@@ -220,7 +220,9 @@ class EXPORT_SCENE_OT_rmv2(bpy.types.Operator, ExportHelper):
     high_precision: BoolProperty(
         name="High Precision Positions", default=True,
         description="Use CA's half-float W-scale trick to squeeze extra "
-        "precision out of vertex positions (slower export)")
+        "precision out of vertex positions (slower export). Warhammer "
+        "3-era (v8) files only: older games' files store positions "
+        "directly, as CA's own do")
     write_attach_points: BoolProperty(
         name="Attachment Points", default=True,
         description="Write attachment points (from the collection's stored "
