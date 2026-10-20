@@ -33,10 +33,49 @@ What came out of it, all fixed:
 - Both ARM formats were being told they rode a skeleton the file never
   names - "mountainb.anim" on a Napoleon mountain with no bones.
 
-Still not done, and still wanting a human: the vegetation point
-attributes (`rmv2_pivot`, `rmv2_wind_0`, `rmv2_wind_1`). Whether eight
-raw numbers in the spreadsheet are any use to a modder, or want naming,
-is a judgement nobody has made yet.
+Still not done, and still wanting a human: how the vegetation point
+attributes should be presented in Blender at all.
+
+What they hold is now established. Sampled 2026-08-27 across the twelve
+vegetation meshes in `samples/`, so read the numbers as a strong hint
+rather than a settled fact. The 60-byte vegetation vertex carries a
+4-wide `pivot` and an 8-wide `wind`, and `FLOAT_COLOR` is the widest
+generic attribute Blender has, so `wind` arrives split across two of
+them:
+
+- `rmv2_wind_0.R` and `.G` are a **weight pair**, summing to exactly 1.0
+  in all ten Rome 2 meshes - though not in Warhammer 3's
+  `wh_ksl_birchtree_totem_f`, so normalisation is not universal.
+- `rmv2_wind_0.B` and `.A` are **indices**: integral in all twelve, and
+  only ever 0, 1 or 2.
+- `rmv2_wind_1.R/G/B` are constant per mesh - 1.0 in eleven of the
+  twelve, 0.0 in `shrub_pine_a`. Still unread.
+- `rmv2_wind_1.A` is per-vertex and continuous, correlating 0.95 to 0.97
+  with distance from the pivot: 0.07 at a trunk base rising to 0.76 at a
+  branch tip. A **sway amplitude**.
+- `rmv2_pivot` is a rest origin, constant per branch - a maple branch
+  mesh has 11 distinct values across 133 vertices - with W always 1.0.
+
+Pairing weight `.R` with index `.B` and `.G` with `.A`, a trunk mesh
+sits wholly on level 0 while branch vertices blend level 1 into level 2.
+Which makes vegetation **a second skinning system**: two influences per
+vertex against a small hierarchy of wind levels, plus a per-vertex
+amplitude and a per-branch origin.
+
+The open question is therefore no longer what they mean but how to show
+them. A weight/index pair is what vertex groups already are, and an
+amplitude is one number that would read better as a single float
+attribute than as the alpha of something Blender files under Vertex ->
+Color. Renaming the two attributes is the cheap option and still an
+improvement on `rmv2_wind_0`; mapping the pair onto real vertex groups
+is the honest one, and needs the exporter to know those groups are not
+skinning.
+
+One hazard either way: `export_rmv2._get_colours` falls back to
+`active_color` and then `color_attributes[0]` when nothing is named
+`Colour`. Vegetation has no colour field, so nothing reads them today -
+but a mesh switched to a layout that does have one could export a wind
+channel as vertex colour.
 
 ### 2. Test something in-game
 
@@ -530,3 +569,42 @@ does — `belt_fabric_03` is Cinematic plus Weighted, `maple_d` is
 Vegetation plus one Tree Billboard card, and Warhammer 3 routinely drops
 a Cinematic mesh to Weighted for its distant LOD. That is settled and is
 why the setting is per mesh.
+
+### 12. A bow wave's second position could be a shape key
+
+The Shogun 2 bow wave vertex (`VF_S2_BOW_WAVE`) stores two positions per
+vertex, and today the second one lands in `RmvMeshData.extras["pos2"]`
+and reaches Blender as the point attribute `rmv2_pos2` like every other
+channel with no ordinary mesh field. Correct, and completely invisible:
+the second shape is right there in the file and nothing in the viewport
+shows it.
+
+Blender does support this, and the mechanism is **shape keys**, not
+per-vertex animation as such. A mesh gets a `Basis` key holding the
+imported positions and a second key holding `pos2`; the second key's
+`value` is an ordinary animatable property, so keyframing it 0 at frame
+1 and 1 at frame 2 makes the mesh visibly move between the two shapes.
+That is the whole feature — no modifier, no geometry nodes, and it
+survives saving to `.blend`.
+
+Two things to get right before it is worth doing:
+
+- **`pos2` is raw game-space today.** The extras ride through untouched,
+  while `positions` are converted and made pivot-relative on the way in.
+  A shape key has to be in the same space as the basis, so this needs
+  `utils.game_to_blender` and the same pivot subtraction the base
+  positions get — and the export path has to undo exactly that instead
+  of copying the attribute back verbatim.
+- **The export path reads the attribute, not the mesh.** `_extra(mesh,
+  "pos2", 4)` pulls `rmv2_pos2` back off the point attributes. If the
+  second position becomes a shape key, export has to read the key's
+  points, and it has to take the *basis* for `pos` rather than whatever
+  the evaluated mesh looks like at the current key value, or a file
+  exported mid-blend writes an interpolated first position.
+
+Whether the keyframes belong in the importer at all is the open
+question: the two positions are a shape the game morphs between on its
+own schedule, so keying them 1-to-2 is a preview convenience, not
+something the file asks for. An import option, defaulting off, is
+probably the honest shape of it. The same trick would suit vegetation's
+rest position (`rmv2_pivot`) if it ever proves useful there.
