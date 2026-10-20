@@ -1968,11 +1968,17 @@ class RmvModel:
         return self.mesh.vertex_count
 
     def computed_bbox(self) -> tuple:
+        """The header's box is in model space: the pivot-relative
+        positions plus the material's pivot.  Every CA mesh with a
+        non-zero pivot whose box fits its own vertices has it so."""
         if self.bbox_min is not None and self.bbox_max is not None:
             return tuple(self.bbox_min), tuple(self.bbox_max)
         if self.mesh.vertex_count:
-            return (tuple(self.mesh.positions.min(axis=0).tolist()),
-                    tuple(self.mesh.positions.max(axis=0).tolist()))
+            pivot = np.asarray(getattr(self.material, "pivot", None)
+                               or (0.0, 0.0, 0.0), dtype=np.float64)
+            pos = self.mesh.positions
+            return (tuple((pos.min(axis=0) + pivot).tolist()),
+                    tuple((pos.max(axis=0) + pivot).tolist()))
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
 

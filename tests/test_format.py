@@ -283,6 +283,18 @@ class TestFileRoundtrip(unittest.TestCase):
                 with self.subTest(version=version, fmt=fmt):
                     self.check_file(version, fmt)
 
+    def test_bbox_includes_pivot(self):
+        """A computed box is in model space, positions plus the pivot,
+        not centred on the origin with the pivot-relative positions."""
+        rmv = make_file(version=8, vertex_format=rf.VF_STATIC, lods=1)
+        model = rmv.lods[0].models[0]
+        out = rf.load(rf.save(rmv)).lods[0].models[0]
+        pivot = np.array(model.material.pivot)
+        np.testing.assert_allclose(
+            out.bbox_min, model.mesh.positions.min(0) + pivot, atol=1e-6)
+        np.testing.assert_allclose(
+            out.bbox_max, model.mesh.positions.max(0) + pivot, atol=1e-6)
+
     def test_bad_magic(self):
         with self.assertRaises(rf.RmvFormatError):
             rf.load(b"NOPE" + b"\0" * 200)

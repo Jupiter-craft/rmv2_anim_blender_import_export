@@ -163,7 +163,7 @@ Two things about this header do not behave as declared:
 | 12 | `u32` | Vertex count |
 | 16 | `u32` | Index block offset, relative to this header |
 | 20 | `u32` | Index count |
-| 24 | `f32[6]` | Bounding box: min xyz then max xyz |
+| 24 | `f32[6]` | Bounding box: min xyz then max xyz, in model space (positions + pivot) |
 | 48 | `char[12]` | Shader name, e.g. `default_dry` |
 | 60 | `char[10]` | Shader values |
 | 70 | `char[10]` | Zero |
@@ -171,6 +171,13 @@ Two things about this header do not behave as declared:
 **In older versions:** v5 is 112 bytes, its three trailing string fields
 at double width. v1 – v3 stop at 48 bytes — the shader fields do not
 exist.
+
+**The bounding box includes the material's pivot.** The positions are
+pivot-relative, but the box is not. The samples have 25 meshes with a
+non-zero pivot: in 21 the box is positions + pivot to within half-float
+precision, in none is it the positions alone, and the other 4 box
+something other than their own vertices. Up to 1.22.2 a computed box left the pivot out, so
+every exported mesh with a pivot had its box centred on the origin.
 
 The material id chooses the header that follows, and the gap between the
 end of this header and the vertex block is how large that material header
