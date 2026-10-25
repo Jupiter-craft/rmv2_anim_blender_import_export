@@ -9,6 +9,7 @@ weights, materials, LOD metadata). Also exports a native Blender cube.
 Exits non-zero on failure.
 """
 
+import math
 import os
 import sys
 import tempfile
@@ -1558,6 +1559,47 @@ def anim_animation_case(tmpdir):
     check(t_err < 1e-4 and q_err < 2e-3,
           f"bind pose matches the source skeleton (t {t_err:.6f}, "
           f"q {q_err:.6f})")
+
+
+def anim_past_half_turn_case(tmpdir):
+    """A bone turning through 180 degrees has to come out with one
+    continuous quaternion track - decompose() alone gives w >= 0 and
+    flips the sign on the frame it crosses."""
+    print("\n=== .anim export keeps quaternion signs continuous ===")
+    reset_scene()
+    skel_path = write_anim(tmpdir, "half_skel.anim", make_skeleton_anim())
+    import_anim.import_file(bpy.context, skel_path, {"mode": "SKELETON"})
+    # Odd bones turn 0.5 rad a frame, so by frame 9 they are at 4.5 rad.
+    # Rebuilt from cos/sin, not Quaternion(axis, angle) - that one wraps
+    # to w >= 0 itself, which is the very flip being tested for.
+    animation = make_animation_anim(frames=10)
+    for f in range(10):
+        for b in range(4):
+            half = 0.125 * f * (1 + b % 2)
+            s = math.sin(half)
+            extra = Quaternion((math.cos(half), 0.0, s, 0.0) if b % 2
+                               else (math.cos(half), s, 0.0, 0.0))
+            q = Quaternion((BIND_R[b][3], *BIND_R[b][:3])) @ extra
+            animation.parts[0].dynamic_frames[f].rotations[b] = (
+                q.x, q.y, q.z, q.w)
+    src = af.resolve(animation).rotations
+    check((src[1:] * src[:-1]).sum(axis=-1).min() > 0.0,
+          "the source track itself is continuous")
+    anim_path = write_anim(tmpdir, "half_run.anim", animation)
+    import_anim.import_file(bpy.context, anim_path, {"mode": "ANIMATION"})
+
+    out_path = os.path.join(tmpdir, "half_out.anim")
+    export_anim.export_file(bpy.context, out_path, {
+        "mode": "ANIMATION", "version": "7", "skeleton_name": "",
+        "frame_rate": 0.0, "global_scale": 1.0})
+    with open(out_path, "rb") as handle:
+        out = af.resolve(af.load(handle.read())).rotations
+    dots = (out[1:] * out[:-1]).sum(axis=-1)
+    check(dots.min() > 0.0,
+          f"no sign flips between frames (min dot {dots.min():.4f})")
+    q_err = np.minimum(np.abs(src - out).max(axis=-1),
+                       np.abs(src + out).max(axis=-1)).max()
+    check(q_err < 2e-3, f"rotations still roundtrip (max err {q_err:.6f})")
 
 
 def anim_mode_gating_case(tmpdir):
@@ -4526,6 +4568,7 @@ def main():
         anim_flow1_case(tmpdir)
         anim_flow2_case(tmpdir)
         anim_animation_case(tmpdir)
+        anim_past_half_turn_case(tmpdir)
         anim_mode_gating_case(tmpdir)
         anim_auto_detect_case(tmpdir)
         building_matrix_index_attach_case(tmpdir)

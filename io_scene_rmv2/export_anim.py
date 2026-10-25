@@ -105,6 +105,22 @@ def _sample_pose(arm_obj, pairs):
     return locs, quats
 
 
+def _keep_hemisphere(rotations):
+    """Negate quaternions in place so each bone's track never jumps to
+    the opposite sign between frames.
+
+    q and -q are the same rotation, and Blender's decompose() always
+    returns the one with w >= 0.  So a bone turning steadily through
+    180 degrees from its rest came out with its sign flipped on the
+    frame it crossed.  Anything interpolating those two keys without
+    picking the near one swings the bone the long way round.  CA's
+    files keep the track continuous (8% of their quaternions have
+    w < 0), and so does the importer."""
+    for f in range(1, len(rotations)):
+        flip = np.sum(rotations[f] * rotations[f - 1], axis=1) < 0.0
+        rotations[f, flip] *= -1.0
+
+
 def _stored_events(arm_settings, warnings) -> list:
     """The Shogun 2 event list kept on the armature at import time."""
     raw = arm_settings.events_json
@@ -216,6 +232,7 @@ def build_anim(context, options: dict, warnings: list):
                 (loc[0] * scale, loc[1] * scale, loc[2] * scale))
             rotations[f, b] = blender_to_game_quaternion_xyzw(
                 frames_quat[f][b])
+    _keep_hemisphere(rotations)
 
     anim = af.build_simple(
         version=version, skeleton_name=skeleton_name,
